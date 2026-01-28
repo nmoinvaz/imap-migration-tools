@@ -51,9 +51,12 @@ This repository contains a set of Python scripts designed to migrate emails betw
 
 ### 1. Prerequisites
 - **Python 3.6+**
-- **No external installations required.**
-  The scripts use only the Python Standard Library, which is installed automatically with Python. You do **not** need to install anything else (no `pip install`).
-  *Used libraries: `imaplib`, `email`, `concurrent.futures`, `re`, `os`, `sys`, `threading`.*
+- **No external installations required for basic (password) authentication.**
+  The scripts use only the Python Standard Library for standard IMAP login.
+
+- **Optional: OAuth2 authentication** requires one additional package depending on your provider:
+  - **Microsoft (Outlook/Office 365):** `pip install msal`
+  - **Google (Gmail):** `pip install google-auth-oauthlib`
 
 ### 2. Installation
 
@@ -102,6 +105,12 @@ You can configure the scripts using **Environment Variables** (recommended for s
    export DEST_IMAP_USERNAME="dest@domain.com"
    export DEST_IMAP_PASSWORD="dest-app-password"
 
+   # OAuth2 (Optional - instead of password)
+   export SRC_OAUTH2_CLIENT_ID="your-client-id"
+   export SRC_OAUTH2_CLIENT_SECRET="your-client-secret"  # Required for Google
+   export DEST_OAUTH2_CLIENT_ID="your-dest-client-id"
+   export DEST_OAUTH2_CLIENT_SECRET="your-dest-client-secret"  # Required for Google
+
    # Options (Optional)
    export DELETE_FROM_SOURCE="false"  # Set to "true" to delete from source after copy
    export MAX_WORKERS=4               # Number of parallel threads
@@ -146,6 +155,12 @@ python3 compare_imap_folders.py --src-host "imap.gmail.com" --dest-host "imap.ot
 **Counting:**
 ```bash
 python3 count_imap_emails.py --host "imap.gmail.com" --user "me@gmail.com" --pass "secret"
+```
+
+**Counting (OAuth2):**
+```bash
+python3 count_imap_emails.py --host "imap.gmail.com" --user "me@gmail.com" \
+  --client-id "id" --client-secret "secret"
 ```
 
 **Backup:**
@@ -199,7 +214,7 @@ export BACKUP_LOCAL_PATH="./backup_folder"
 python3 backup_imap_emails.py
 
 # Or via command line
-python3 backup_imap_emails.py --dest-path "/Users/jdoe/Documents/Emails" 
+python3 backup_imap_emails.py --dest-path "/Users/jdoe/Documents/Emails"
 
 # Backup single folder
 python3 backup_imap_emails.py --dest-path "./my_backup" "[Gmail]/Sent Mail"
@@ -354,13 +369,81 @@ python3 restore_imap_emails.py \
   --apply-flags
 ```
 
+## OAuth2 Authentication
+
+All scripts support OAuth2 as an alternative to password-based authentication. The OAuth2 provider is **auto-detected** from the IMAP host:
+
+| IMAP Host contains | Detected Provider |
+|---|---|
+| `outlook`, `office365`, `microsoft` | Microsoft |
+| `gmail`, `google` | Google |
+
+To use OAuth2, pass `--src-client-id` (and `--src-client-secret` for Google) instead of `--src-pass`. When a client ID is provided, the script skips password authentication and uses OAuth2 instead.
+
+### Microsoft (Outlook / Office 365)
+
+Requires the `msal` package (`pip install msal`). Uses the **device code flow** — no browser redirect needed. The tenant ID is auto-discovered from the user's email domain.
+
+```bash
+# Install dependency
+pip install msal
+
+# Migration with Microsoft OAuth2 on source
+python3 migrate_imap_emails.py \
+  --src-host "outlook.office365.com" \
+  --src-user "user@contoso.com" \
+  --src-client-id "your-azure-app-client-id" \
+  --dest-host "imap.other.com" \
+  --dest-user "user@other.com" \
+  --dest-pass "password"
+```
+
+The script will print a device code and URL. Open the URL in a browser, enter the code, and sign in to authorize access.
+
+### Google (Gmail)
+
+Requires the `google-auth-oauthlib` package (`pip install google-auth-oauthlib`). Uses the **installed app flow** — opens a browser window for consent. Both `--client-id` and `--client-secret` are required.
+
+```bash
+# Install dependency
+pip install google-auth-oauthlib
+
+# Backup with Google OAuth2
+python3 backup_imap_emails.py \
+  --src-host "imap.gmail.com" \
+  --src-user "you@gmail.com" \
+  --src-client-id "your-google-client-id" \
+  --src-client-secret "your-google-client-secret" \
+  --dest-path "./gmail_backup"
+```
+
+The script will open your default browser for Google sign-in. After authorizing, the token is returned automatically via a local HTTP redirect.
+
+### OAuth2 Arguments Reference
+
+**Single-account scripts** (`count_imap_emails.py`):
+
+| Argument | Environment Variable | Description |
+|---|---|---|
+| `--client-id` | `OAUTH2_CLIENT_ID` | OAuth2 Client ID |
+| `--client-secret` | `OAUTH2_CLIENT_SECRET` | OAuth2 Client Secret (required for Google) |
+
+**Dual-account scripts** (`migrate_imap_emails.py`, `compare_imap_folders.py`, `backup_imap_emails.py`):
+
+| Argument | Environment Variable | Description |
+|---|---|---|
+| `--src-client-id` | `SRC_OAUTH2_CLIENT_ID` | Source OAuth2 Client ID |
+| `--src-client-secret` | `SRC_OAUTH2_CLIENT_SECRET` | Source OAuth2 Client Secret (required for Google) |
+| `--dest-client-id` | `DEST_OAUTH2_CLIENT_ID` | Destination OAuth2 Client ID |
+| `--dest-client-secret` | `DEST_OAUTH2_CLIENT_SECRET` | Destination OAuth2 Client Secret (required for Google) |
+
 ## Troubleshooting
 
-- **"Too many simultaneous connections"**: 
+- **"Too many simultaneous connections"**:
   IMAP servers (especially Gmail) limit the number of active connections per IP or user (typically ~15). Since `migrate_imap_emails.py` uses multiple threads, you may hit this limit.
   **Solution**: Reduce `MAX_WORKERS` to `4` or `2` using the environment variable.
 
-- **Authentication Errors**: 
+- **Authentication Errors**:
   If you are using Gmail or Google Workspace, you generally **cannot** use your regular login password. You must enable 2-Step Verification and generate an **App Password**. Use that App Password in the `_PASSWORD` variable.
 
 - **Timeouts / Socket Errors**:

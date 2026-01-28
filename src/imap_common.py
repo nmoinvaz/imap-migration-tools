@@ -25,18 +25,174 @@ def verify_env_vars(vars_list):
     return True
 
 
-def get_imap_connection(host, user, password):
+def detect_oauth2_provider(host):
+    """
+    Detects the OAuth2 provider from the IMAP host.
+    Returns "microsoft", "google", or None if unrecognized.
+    """
+    host_lower = host.lower()
+    if "outlook" in host_lower or "office365" in host_lower or "microsoft" in host_lower:
+        return "microsoft"
+    if "gmail" in host_lower or "google" in host_lower:
+        return "google"
+    return None
+
+
+def discover_microsoft_tenant(email):
+    """
+    Auto-discovers the Microsoft tenant ID from an email address domain.
+    Uses the OpenID Connect discovery endpoint (no authentication required).
+    Returns the tenant ID string or None if discovery fails.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    domain = email.split("@")[-1]
+    url = f"https://login.microsoftonline.com/{domain}/.well-known/openid-configuration"
+
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, json.JSONDecodeError) as e:
+        print(f"Error: Could not discover Microsoft tenant for domain '{domain}': {e}")
+        return None
+
+    issuer = data.get("issuer", "")
+    match = re.search(r"/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", issuer)
+    if match:
+        return match.group(1)
+
+    print(f"Error: Could not extract tenant ID from issuer: {issuer}")
+    return None
+
+
+def acquire_microsoft_oauth2_token(client_id, email):
+    """
+    Acquires a Microsoft OAuth2 access token using the MSAL device code flow.
+    Auto-discovers tenant ID from the email domain.
+    Requires the 'msal' package: pip install msal
+    """
+    try:
+        import msal
+    except ImportError:
+        print("Error: 'msal' package is required for Microsoft OAuth2. Install it with: pip install msal")
+        sys.exit(1)
+
+    tenant_id = discover_microsoft_tenant(email)
+    if not tenant_id:
+        return None
+
+    print(f"Discovered Microsoft tenant: {tenant_id}")
+
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+    scopes = ["https://outlook.office365.com/IMAP.AccessAsUser.All"]
+
+    app = msal.PublicClientApplication(client_id, authority=authority)
+
+    # Try cached token first
+    accounts = app.get_accounts()
+    if accounts:
+        result = app.acquire_token_silent(scopes, account=accounts[0])
+        if result and "access_token" in result:
+            return result["access_token"]
+
+    # Fall back to device code flow
+    flow = app.initiate_device_flow(scopes=scopes)
+    if "user_code" not in flow:
+        print(f"Error: Could not initiate device flow: {flow.get('error_description', 'Unknown error')}")
+        return None
+
+    print(flow["message"])
+    result = app.acquire_token_by_device_flow(flow)
+
+    if "access_token" in result:
+        return result["access_token"]
+
+    print(f"Error: Could not acquire token: {result.get('error_description', 'Unknown error')}")
+    return None
+
+
+def acquire_google_oauth2_token(client_id, client_secret):
+    """
+    Acquires a Google OAuth2 access token using the installed app flow.
+    Opens a browser for user consent and runs a local HTTP server for the redirect.
+    Requires the 'google-auth-oauthlib' package: pip install google-auth-oauthlib
+    """
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError:
+        print("Error: 'google-auth-oauthlib' package is required for Google OAuth2.")
+        print("Install it with: pip install google-auth-oauthlib")
+        sys.exit(1)
+
+    client_config = {
+        "installed": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": ["http://localhost"],
+        }
+    }
+
+    flow = InstalledAppFlow.from_client_config(client_config, scopes=["https://mail.google.com/"])
+
+    print("Opening browser for Google authentication...")
+    print("If the browser does not open, check the terminal for a URL to visit.")
+
+    credentials = flow.run_local_server(port=0)
+
+    if credentials and credentials.token:
+        return credentials.token
+
+    print("Error: Could not acquire Google OAuth2 token.")
+    return None
+
+
+def acquire_oauth2_token_for_provider(provider, client_id, email, client_secret=None):
+    """
+    Acquires an OAuth2 token for the specified provider.
+
+    Args:
+        provider: "microsoft" or "google"
+        client_id: OAuth2 client ID
+        email: User's email address (used for Microsoft tenant discovery)
+        client_secret: Required for Google, not needed for Microsoft
+    """
+    if provider == "microsoft":
+        return acquire_microsoft_oauth2_token(client_id, email)
+    elif provider == "google":
+        if not client_secret:
+            print("Error: --client-secret is required for Google OAuth2.")
+            return None
+        return acquire_google_oauth2_token(client_id, client_secret)
+    else:
+        print(f"Error: Unknown OAuth2 provider: {provider}")
+        return None
+
+
+def get_imap_connection(host, user, password=None, oauth2_token=None):
     """
     Establishes an SSL connection to the IMAP server and logs in.
+    Supports both basic auth (password) and OAuth 2.0 (XOAUTH2).
     Returns the connection object or None if failed.
     """
-    if not all([host, user, password]):
+    if not host or not user:
         print(f"Error: Invalid credentials for {host}")
+        return None
+
+    if not password and not oauth2_token:
+        print(f"Error: Either password or oauth2_token is required for {host}")
         return None
 
     try:
         conn = imaplib.IMAP4_SSL(host)
-        conn.login(user, password)
+        if oauth2_token:
+            auth_string = f"user={user}\x01auth=Bearer {oauth2_token}\x01\x01"
+            conn.authenticate("XOAUTH2", lambda _: auth_string.encode())
+        else:
+            conn.login(user, password)
         return conn
     except Exception as e:
         print(f"Connection error to {host}: {e}")
