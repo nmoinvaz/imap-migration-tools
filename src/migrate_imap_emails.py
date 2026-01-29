@@ -65,31 +65,49 @@ def safe_print(message):
         print(f"[{short_name}] {message}")
 
 
-def get_thread_connections(src_conf, dest_conf):
+def get_thread_connections(src_conf, dest_conf, src_oauth2_ctx=None, dest_oauth2_ctx=None):
     # Initialize connections for this thread if they don't exist or are closed
     if not hasattr(thread_local, "src") or thread_local.src is None:
         thread_local.src = imap_common.get_imap_connection(*src_conf)
     if not hasattr(thread_local, "dest") or thread_local.dest is None:
         thread_local.dest = imap_common.get_imap_connection(*dest_conf)
 
-    # Simple check if alive (noop)
+    # Simple check if alive (noop), reconnect if dead
     try:
         if thread_local.src:
             thread_local.src.noop()
     except:
         thread_local.src = imap_common.get_imap_connection(*src_conf)
+        # If reconnection failed (possibly expired token), try refreshing
+        if thread_local.src is None and src_oauth2_ctx:
+            old_token = src_conf[3]
+            imap_common.refresh_oauth2_token(
+                src_oauth2_ctx["provider"], src_oauth2_ctx["client_id"],
+                src_oauth2_ctx["email"], src_oauth2_ctx["client_secret"],
+                src_conf, old_token,
+            )
+            thread_local.src = imap_common.get_imap_connection(*src_conf)
 
     try:
         if thread_local.dest:
             thread_local.dest.noop()
     except:
         thread_local.dest = imap_common.get_imap_connection(*dest_conf)
+        if thread_local.dest is None and dest_oauth2_ctx:
+            old_token = dest_conf[3]
+            imap_common.refresh_oauth2_token(
+                dest_oauth2_ctx["provider"], dest_oauth2_ctx["client_id"],
+                dest_oauth2_ctx["email"], dest_oauth2_ctx["client_secret"],
+                dest_conf, old_token,
+            )
+            thread_local.dest = imap_common.get_imap_connection(*dest_conf)
 
     return thread_local.src, thread_local.dest
 
 
-def process_batch(uids, folder_name, src_conf, dest_conf, delete_from_source, trash_folder=None):
-    src, dest = get_thread_connections(src_conf, dest_conf)
+def process_batch(uids, folder_name, src_conf, dest_conf, delete_from_source, trash_folder=None,
+                   src_oauth2_ctx=None, dest_oauth2_ctx=None):
+    src, dest = get_thread_connections(src_conf, dest_conf, src_oauth2_ctx, dest_oauth2_ctx)
     if not src or not dest:
         safe_print("Error: Could not establish connections in worker thread.")
         return
@@ -174,7 +192,8 @@ def process_batch(uids, folder_name, src_conf, dest_conf, delete_from_source, tr
             safe_print(f"[{folder_name}] ERROR Expunge: {e}")
 
 
-def migrate_folder(src, dest, folder_name, delete_from_source, src_conf, dest_conf, trash_folder=None):
+def migrate_folder(src, dest, folder_name, delete_from_source, src_conf, dest_conf, trash_folder=None,
+                   src_oauth2_ctx=None, dest_oauth2_ctx=None):
     safe_print(f"--- Preparing Folder: {folder_name} ---")
 
     # Maintain folder structure
@@ -216,7 +235,8 @@ def migrate_folder(src, dest, folder_name, delete_from_source, src_conf, dest_co
         for batch in uid_batches:
             futures.append(
                 executor.submit(
-                    process_batch, batch, folder_name, src_conf, dest_conf, delete_from_source, trash_folder
+                    process_batch, batch, folder_name, src_conf, dest_conf, delete_from_source, trash_folder,
+                    src_oauth2_ctx, dest_oauth2_ctx,
                 )
             )
 
@@ -353,8 +373,19 @@ def main():
         print(f"Target Folder   : {TARGET_FOLDER}")
     print("-----------------------------\n")
 
-    src_conf = (SRC_HOST, SRC_USER, SRC_PASS, src_oauth2_token)
-    dest_conf = (DEST_HOST, DEST_USER, DEST_PASS, dest_oauth2_token)
+    # Use lists (not tuples) so token updates propagate to worker threads
+    src_conf = [SRC_HOST, SRC_USER, SRC_PASS, src_oauth2_token]
+    dest_conf = [DEST_HOST, DEST_USER, DEST_PASS, dest_oauth2_token]
+
+    # OAuth2 context for thread-safe token refresh (None if not using OAuth2)
+    src_oauth2_ctx = {
+        "provider": src_oauth2_provider, "client_id": args.src_client_id,
+        "email": SRC_USER, "client_secret": args.src_client_secret,
+    } if src_use_oauth2 else None
+    dest_oauth2_ctx = {
+        "provider": dest_oauth2_provider, "client_id": args.dest_client_id,
+        "email": DEST_USER, "client_secret": args.dest_client_secret,
+    } if dest_use_oauth2 else None
 
     try:
         # Initial connection to list folders
@@ -391,7 +422,8 @@ def main():
 
             safe_print(f"Starting migration for single folder: {TARGET_FOLDER}")
             # Verify folder exists first? imaplib usually handles select error if not found
-            migrate_folder(src_main, dest_main, TARGET_FOLDER, DELETE_SOURCE, src_conf, dest_conf, trash_folder)
+            migrate_folder(src_main, dest_main, TARGET_FOLDER, DELETE_SOURCE, src_conf, dest_conf, trash_folder,
+                           src_oauth2_ctx, dest_oauth2_ctx)
         else:
             # Migration for all folders
             folders = imap_common.list_selectable_folders(src_main)
@@ -402,14 +434,39 @@ def main():
                     safe_print(f"Skipping migration of Trash folder '{name}' (preventing circular migration).")
                     continue
 
-                # Ensure main connections are alive (reconnect on broken pipe, timeout, etc.)
-                src_main = imap_common.ensure_connection(src_main, *src_conf)
-                dest_main = imap_common.ensure_connection(dest_main, *dest_conf)
-                if not src_main or not dest_main:
-                    safe_print("Fatal: Could not reconnect to IMAP server(s). Aborting.")
-                    sys.exit(1)
+                # Ensure main connections are alive (reconnect on broken pipe, token expiry, etc.)
+                try:
+                    src_main.noop()
+                except Exception:
+                    if src_oauth2_ctx:
+                        safe_print("Refreshing source OAuth2 token...")
+                        imap_common.refresh_oauth2_token(
+                            src_oauth2_ctx["provider"], src_oauth2_ctx["client_id"],
+                            src_oauth2_ctx["email"], src_oauth2_ctx["client_secret"],
+                            src_conf, src_conf[3],
+                        )
+                    src_main = imap_common.get_imap_connection(*src_conf)
+                    if not src_main:
+                        safe_print("Fatal: Could not reconnect to source. Aborting.")
+                        sys.exit(1)
 
-                migrate_folder(src_main, dest_main, name, DELETE_SOURCE, src_conf, dest_conf, trash_folder)
+                try:
+                    dest_main.noop()
+                except Exception:
+                    if dest_oauth2_ctx:
+                        safe_print("Refreshing destination OAuth2 token...")
+                        imap_common.refresh_oauth2_token(
+                            dest_oauth2_ctx["provider"], dest_oauth2_ctx["client_id"],
+                            dest_oauth2_ctx["email"], dest_oauth2_ctx["client_secret"],
+                            dest_conf, dest_conf[3],
+                        )
+                    dest_main = imap_common.get_imap_connection(*dest_conf)
+                    if not dest_main:
+                        safe_print("Fatal: Could not reconnect to destination. Aborting.")
+                        sys.exit(1)
+
+                migrate_folder(src_main, dest_main, name, DELETE_SOURCE, src_conf, dest_conf, trash_folder,
+                               src_oauth2_ctx, dest_oauth2_ctx)
 
         src_main.logout()
         dest_main.logout()

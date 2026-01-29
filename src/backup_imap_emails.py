@@ -60,7 +60,7 @@ def safe_print(message):
         print(f"[{short_name}] {message}")
 
 
-def get_thread_connection(src_conf):
+def get_thread_connection(src_conf, oauth2_ctx=None):
     if not hasattr(thread_local, "src") or thread_local.src is None:
         thread_local.src = imap_common.get_imap_connection(*src_conf)
     try:
@@ -68,11 +68,20 @@ def get_thread_connection(src_conf):
             thread_local.src.noop()
     except:
         thread_local.src = imap_common.get_imap_connection(*src_conf)
+        # If reconnection failed (possibly expired token), try refreshing
+        if thread_local.src is None and oauth2_ctx:
+            old_token = src_conf[3]
+            imap_common.refresh_oauth2_token(
+                oauth2_ctx["provider"], oauth2_ctx["client_id"],
+                oauth2_ctx["email"], oauth2_ctx["client_secret"],
+                src_conf, old_token,
+            )
+            thread_local.src = imap_common.get_imap_connection(*src_conf)
     return thread_local.src
 
 
-def process_batch(uids, folder_name, src_conf, local_folder_path):
-    src = get_thread_connection(src_conf)
+def process_batch(uids, folder_name, src_conf, local_folder_path, oauth2_ctx=None):
+    src = get_thread_connection(src_conf, oauth2_ctx)
     if not src:
         safe_print("Error: Could not establish connection for batch.")
         return
@@ -508,7 +517,7 @@ def load_labels_manifest(local_path):
     return {}
 
 
-def backup_folder(src_main, folder_name, local_base_path, src_conf):
+def backup_folder(src_main, folder_name, local_base_path, src_conf, oauth2_ctx=None):
     safe_print(f"--- Processing Folder: {folder_name} ---")
 
     # create local path
@@ -572,7 +581,7 @@ def backup_folder(src_main, folder_name, local_base_path, src_conf):
     try:
         futures = []
         for batch in uid_batches:
-            futures.append(executor.submit(process_batch, batch, folder_name, src_conf, local_folder_path))
+            futures.append(executor.submit(process_batch, batch, folder_name, src_conf, local_folder_path, oauth2_ctx))
 
         for future in concurrent.futures.as_completed(futures):
             future.result()
@@ -662,7 +671,14 @@ def main():
             sys.exit(1)
         print("OAuth2 token acquired successfully.\n")
 
-    src_conf = (args.src_host, args.src_user, args.src_pass, oauth2_token)
+    # Use a list (not tuple) so token updates propagate to worker threads
+    src_conf = [args.src_host, args.src_user, args.src_pass, oauth2_token]
+
+    # OAuth2 context for thread-safe token refresh (None if not using OAuth2)
+    oauth2_ctx = {
+        "provider": oauth2_provider, "client_id": args.src_client_id,
+        "email": args.src_user, "client_secret": args.src_client_secret,
+    } if use_oauth2 else None
 
     # Expand path (~/...)
     local_path = os.path.expanduser(args.dest_path)
@@ -724,18 +740,28 @@ def main():
 
         # Gmail mode: backup only [Gmail]/All Mail
         if args.gmail_mode:
-            backup_folder(src, "[Gmail]/All Mail", local_path, src_conf)
+            backup_folder(src, "[Gmail]/All Mail", local_path, src_conf, oauth2_ctx)
         elif args.folder:
-            backup_folder(src, args.folder, local_path, src_conf)
+            backup_folder(src, args.folder, local_path, src_conf, oauth2_ctx)
         else:
             folders = imap_common.list_selectable_folders(src)
             for name in folders:
-                # Ensure connection is alive (reconnect on broken pipe, timeout, etc.)
-                src = imap_common.ensure_connection(src, *src_conf)
-                if not src:
-                    print("Fatal: Could not reconnect to IMAP server. Aborting.")
-                    sys.exit(1)
-                backup_folder(src, name, local_path, src_conf)
+                # Ensure connection is alive (reconnect on broken pipe, token expiry, etc.)
+                try:
+                    src.noop()
+                except Exception:
+                    if oauth2_ctx:
+                        safe_print("Refreshing OAuth2 token...")
+                        imap_common.refresh_oauth2_token(
+                            oauth2_ctx["provider"], oauth2_ctx["client_id"],
+                            oauth2_ctx["email"], oauth2_ctx["client_secret"],
+                            src_conf, src_conf[3],
+                        )
+                    src = imap_common.get_imap_connection(*src_conf)
+                    if not src:
+                        print("Fatal: Could not reconnect to IMAP server. Aborting.")
+                        sys.exit(1)
+                backup_folder(src, name, local_path, src_conf, oauth2_ctx)
 
         src.logout()
         print("\nBackup completed successfully.")

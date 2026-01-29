@@ -446,6 +446,16 @@ class TestDiscoverMicrosoftTenant:
         assert "Could not extract tenant ID" in captured.out
 
 
+@pytest.fixture(autouse=True)
+def clear_oauth2_caches():
+    """Clear module-level OAuth2 caches between tests."""
+    imap_common._msal_app_cache.clear()
+    imap_common._google_creds_cache.clear()
+    yield
+    imap_common._msal_app_cache.clear()
+    imap_common._google_creds_cache.clear()
+
+
 class TestAcquireMicrosoftOauth2Token:
     """Tests for acquire_microsoft_oauth2_token function."""
 
@@ -569,3 +579,192 @@ class TestAcquireOauth2TokenForProvider:
         assert result is None
         captured = capsys.readouterr()
         assert "Unknown OAuth2 provider" in captured.out
+
+
+class TestMicrosoftTokenRefresh:
+    """Tests for Microsoft OAuth2 token caching and refresh."""
+
+    def test_msal_app_cached_on_first_call(self):
+        """Test MSAL app is cached after first call."""
+        with patch.object(imap_common, "discover_microsoft_tenant", return_value="tenant-123"):
+            mock_msal = MagicMock()
+            mock_app = MagicMock()
+            mock_app.get_accounts.return_value = []
+            mock_app.initiate_device_flow.return_value = {"user_code": "ABC", "message": "Go to..."}
+            mock_app.acquire_token_by_device_flow.return_value = {"access_token": "token1"}
+            mock_msal.PublicClientApplication.return_value = mock_app
+
+            with patch.dict("sys.modules", {"msal": mock_msal}):
+                imap_common.acquire_microsoft_oauth2_token("client-id", "user@test.com")
+
+            assert ("client-id", "tenant-123") in imap_common._msal_app_cache
+
+    def test_cached_app_reused_on_second_call(self):
+        """Test second call reuses cached MSAL app instead of creating new one."""
+        with patch.object(imap_common, "discover_microsoft_tenant", return_value="tenant-123"):
+            mock_msal = MagicMock()
+            mock_app = MagicMock()
+            mock_app.get_accounts.return_value = []
+            mock_app.initiate_device_flow.return_value = {"user_code": "ABC", "message": "Go to..."}
+            mock_app.acquire_token_by_device_flow.return_value = {"access_token": "token1"}
+            mock_msal.PublicClientApplication.return_value = mock_app
+
+            with patch.dict("sys.modules", {"msal": mock_msal}):
+                imap_common.acquire_microsoft_oauth2_token("client-id", "user@test.com")
+
+                # Second call — simulate cached token available (refresh token worked)
+                mock_account = {"username": "user@test.com"}
+                mock_app.get_accounts.return_value = [mock_account]
+                mock_app.acquire_token_silent.return_value = {"access_token": "refreshed_token"}
+
+                result = imap_common.acquire_microsoft_oauth2_token("client-id", "user@test.com")
+
+            assert result == "refreshed_token"
+            # PublicClientApplication should only have been called once (first call)
+            assert mock_msal.PublicClientApplication.call_count == 1
+
+
+class TestGoogleTokenRefresh:
+    """Tests for Google OAuth2 token caching and refresh."""
+
+    def test_credentials_cached_on_first_call(self):
+        """Test Google credentials are cached after first call."""
+        mock_credentials = MagicMock()
+        mock_credentials.token = "google_token"
+
+        mock_flow = MagicMock()
+        mock_flow.run_local_server.return_value = mock_credentials
+
+        mock_installed_app_flow = MagicMock()
+        mock_installed_app_flow.from_client_config.return_value = mock_flow
+
+        mock_module = MagicMock()
+        mock_module.InstalledAppFlow = mock_installed_app_flow
+
+        with patch.dict("sys.modules", {"google_auth_oauthlib": MagicMock(), "google_auth_oauthlib.flow": mock_module}):
+            imap_common.acquire_google_oauth2_token("client-id", "client-secret")
+
+        assert ("client-id", "client-secret") in imap_common._google_creds_cache
+
+    def test_cached_credentials_refreshed_on_second_call(self):
+        """Test second call refreshes cached credentials without opening browser."""
+        # Pre-populate cache with credentials that have a refresh token
+        mock_creds = MagicMock()
+        mock_creds.refresh_token = "refresh_tok"
+        mock_creds.token = "refreshed_google_token"
+        imap_common._google_creds_cache[("client-id", "client-secret")] = mock_creds
+
+        mock_request_module = MagicMock()
+        with patch.dict("sys.modules", {
+            "google": MagicMock(),
+            "google.auth": MagicMock(),
+            "google.auth.transport": MagicMock(),
+            "google.auth.transport.requests": mock_request_module,
+        }):
+            result = imap_common.acquire_google_oauth2_token("client-id", "client-secret")
+
+        assert result == "refreshed_google_token"
+        # Verify refresh was called
+        mock_creds.refresh.assert_called_once()
+
+    def test_falls_back_to_browser_if_refresh_fails(self):
+        """Test falls back to full auth flow if cached token refresh fails."""
+        # Pre-populate cache with credentials whose refresh fails
+        mock_creds = MagicMock()
+        mock_creds.refresh_token = "refresh_tok"
+        mock_creds.refresh.side_effect = Exception("Refresh failed")
+        imap_common._google_creds_cache[("client-id", "client-secret")] = mock_creds
+
+        # Set up the full auth flow
+        mock_credentials = MagicMock()
+        mock_credentials.token = "new_browser_token"
+
+        mock_flow = MagicMock()
+        mock_flow.run_local_server.return_value = mock_credentials
+
+        mock_installed_app_flow = MagicMock()
+        mock_installed_app_flow.from_client_config.return_value = mock_flow
+
+        mock_module = MagicMock()
+        mock_module.InstalledAppFlow = mock_installed_app_flow
+
+        with patch.dict("sys.modules", {"google_auth_oauthlib": MagicMock(), "google_auth_oauthlib.flow": mock_module}):
+            result = imap_common.acquire_google_oauth2_token("client-id", "client-secret")
+
+        assert result == "new_browser_token"
+
+
+class TestRefreshOauth2Token:
+    """Tests for thread-safe refresh_oauth2_token function."""
+
+    def test_refreshes_token_and_updates_conf(self):
+        """Test that a new token is acquired and conf[3] is updated."""
+        conf = ["host", "user", "pass", "old_token"]
+
+        with patch.object(imap_common, "acquire_oauth2_token_for_provider", return_value="new_token") as mock_acquire:
+            result = imap_common.refresh_oauth2_token(
+                "microsoft", "client-id", "user@test.com", None, conf, "old_token"
+            )
+
+        assert result == "new_token"
+        assert conf[3] == "new_token"
+        mock_acquire.assert_called_once_with("microsoft", "client-id", "user@test.com", None)
+
+    def test_skips_refresh_when_token_already_updated(self):
+        """Test that refresh is skipped if another thread already updated the token."""
+        conf = ["host", "user", "pass", "already_refreshed_token"]
+
+        with patch.object(imap_common, "acquire_oauth2_token_for_provider") as mock_acquire:
+            result = imap_common.refresh_oauth2_token(
+                "microsoft", "client-id", "user@test.com", None, conf, "old_token"
+            )
+
+        assert result == "already_refreshed_token"
+        assert conf[3] == "already_refreshed_token"
+        mock_acquire.assert_not_called()
+
+    def test_returns_none_on_refresh_failure(self):
+        """Test returns None and leaves conf unchanged when refresh fails."""
+        conf = ["host", "user", "pass", "old_token"]
+
+        with patch.object(imap_common, "acquire_oauth2_token_for_provider", return_value=None):
+            result = imap_common.refresh_oauth2_token(
+                "google", "client-id", "user@gmail.com", "secret", conf, "old_token"
+            )
+
+        assert result is None
+        assert conf[3] == "old_token"
+
+    def test_concurrent_threads_only_one_refreshes(self):
+        """Test that only one thread performs the refresh when multiple threads compete."""
+        import threading
+        import time
+
+        conf = ["host", "user", "pass", "expired_token"]
+        call_count = {"value": 0}
+        barrier = threading.Barrier(3)  # 3 threads
+
+        original_acquire = imap_common.acquire_oauth2_token_for_provider
+
+        def slow_acquire(provider, client_id, email, client_secret):
+            call_count["value"] += 1
+            time.sleep(0.05)  # Simulate network delay
+            return "fresh_token"
+
+        def thread_func():
+            barrier.wait()  # Ensure all threads start at the same time
+            imap_common.refresh_oauth2_token(
+                "microsoft", "client-id", "user@test.com", None, conf, "expired_token"
+            )
+
+        with patch.object(imap_common, "acquire_oauth2_token_for_provider", side_effect=slow_acquire):
+            threads = [threading.Thread(target=thread_func) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        # Only one thread should have called acquire (the first to get the lock).
+        # The other two should see conf[3] changed and skip.
+        assert call_count["value"] == 1
+        assert conf[3] == "fresh_token"
