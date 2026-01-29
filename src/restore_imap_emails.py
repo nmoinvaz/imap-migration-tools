@@ -36,6 +36,7 @@ from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 
 import imap_common
+import imap_oauth2
 
 # Defaults
 MAX_WORKERS = 4  # Lower default for restore to avoid rate limits
@@ -53,7 +54,7 @@ def safe_print(message):
         print(f"[{short_name}] {message}")
 
 
-def get_thread_connection(dest_conf):
+def get_thread_connection(dest_conf, oauth2_ctx=None):
     """Get or create a thread-local IMAP connection."""
     if not hasattr(thread_local, "dest") or thread_local.dest is None:
         thread_local.dest = imap_common.get_imap_connection(*dest_conf)
@@ -62,6 +63,15 @@ def get_thread_connection(dest_conf):
             thread_local.dest.noop()
     except Exception:
         thread_local.dest = imap_common.get_imap_connection(*dest_conf)
+        # If reconnection failed (possibly expired token), try refreshing
+        if thread_local.dest is None and oauth2_ctx:
+            old_token = dest_conf[3]
+            imap_oauth2.refresh_oauth2_token(
+                oauth2_ctx["provider"], oauth2_ctx["client_id"],
+                oauth2_ctx["email"], oauth2_ctx["client_secret"],
+                dest_conf, old_token,
+            )
+            thread_local.dest = imap_common.get_imap_connection(*dest_conf)
     return thread_local.dest
 
 
@@ -311,7 +321,7 @@ def label_to_folder(label):
 
 
 def process_restore_batch(eml_files, folder_name, dest_conf, manifest, apply_labels, apply_flags,
-                          dest_msg_ids=None):
+                          dest_msg_ids=None, oauth2_ctx=None):
     """
     Process a batch of .eml files for restoration.
 
@@ -321,8 +331,9 @@ def process_restore_batch(eml_files, folder_name, dest_conf, manifest, apply_lab
         apply_labels: Whether to apply Gmail labels from manifest
         apply_flags: Whether to apply IMAP flags from manifest
         dest_msg_ids: Optional pre-fetched set of Message-IDs for fast duplicate check
+        oauth2_ctx: OAuth2 context for token refresh on reconnection
     """
-    dest = get_thread_connection(dest_conf)
+    dest = get_thread_connection(dest_conf, oauth2_ctx)
     if not dest:
         safe_print("Error: Could not establish connection for batch.")
         return
@@ -430,7 +441,8 @@ def process_restore_batch(eml_files, folder_name, dest_conf, manifest, apply_lab
             safe_print(f"Error processing {filename}: {e}")
 
 
-def restore_folder(folder_name, local_folder_path, dest_conf, manifest, apply_labels, apply_flags):
+def restore_folder(folder_name, local_folder_path, dest_conf, manifest, apply_labels, apply_flags,
+                   oauth2_ctx=None):
     """
     Restore all emails from a local folder to the destination IMAP server.
     """
@@ -478,6 +490,7 @@ def restore_folder(folder_name, local_folder_path, dest_conf, manifest, apply_la
                     apply_labels,
                     apply_flags,
                     dest_msg_ids,
+                    oauth2_ctx,
                 )
             )
 
@@ -488,7 +501,7 @@ def restore_folder(folder_name, local_folder_path, dest_conf, manifest, apply_la
                 safe_print(f"Batch error: {e}")
 
 
-def restore_gmail_with_labels(local_path, dest_conf, manifest, apply_flags):
+def restore_gmail_with_labels(local_path, dest_conf, manifest, apply_flags, oauth2_ctx=None):
     """
     Special restoration mode for Gmail: Upload emails to their first label folder
     and then apply additional labels from the manifest.
@@ -534,6 +547,8 @@ def restore_gmail_with_labels(local_path, dest_conf, manifest, apply_flags):
                     manifest,
                     True,  # apply_labels
                     apply_flags,  # apply_flags
+                    None,  # dest_msg_ids (not applicable in Gmail mode)
+                    oauth2_ctx,
                 )
             )
 
@@ -605,6 +620,16 @@ def main():
         default=os.getenv("DEST_IMAP_PASSWORD"),
         help="Destination Password",
     )
+    parser.add_argument(
+        "--dest-client-id",
+        default=os.getenv("DEST_OAUTH2_CLIENT_ID"),
+        help="Destination OAuth2 Client ID",
+    )
+    parser.add_argument(
+        "--dest-client-secret",
+        default=os.getenv("DEST_OAUTH2_CLIENT_SECRET"),
+        help="Destination OAuth2 Client Secret (required for Google)",
+    )
 
     # Config
     parser.add_argument(
@@ -643,13 +668,14 @@ def main():
     args = parser.parse_args()
 
     # Validate
+    dest_use_oauth2 = bool(args.dest_client_id)
     missing = []
     if not args.dest_host:
         missing.append("DEST_IMAP_HOST")
     if not args.dest_user:
         missing.append("DEST_IMAP_USERNAME")
-    if not args.dest_pass:
-        missing.append("DEST_IMAP_PASSWORD")
+    if not args.dest_pass and not dest_use_oauth2:
+        missing.append("DEST_IMAP_PASSWORD (or --dest-client-id for OAuth2)")
 
     if missing:
         print(f"Error: Missing credentials: {', '.join(missing)}")
@@ -664,7 +690,31 @@ def main():
     MAX_WORKERS = args.workers
     BATCH_SIZE = args.batch
 
-    dest_conf = (args.dest_host, args.dest_user, args.dest_pass)
+    # Acquire OAuth2 token if configured
+    dest_oauth2_token = None
+    dest_oauth2_provider = None
+    if dest_use_oauth2:
+        dest_oauth2_provider = imap_oauth2.detect_oauth2_provider(args.dest_host)
+        if not dest_oauth2_provider:
+            print(f"Error: Could not detect OAuth2 provider from host '{args.dest_host}'.")
+            sys.exit(1)
+        print(f"Acquiring OAuth2 token for destination ({dest_oauth2_provider})...")
+        dest_oauth2_token = imap_oauth2.acquire_oauth2_token_for_provider(
+            dest_oauth2_provider, args.dest_client_id, args.dest_user, args.dest_client_secret
+        )
+        if not dest_oauth2_token:
+            print("Error: Failed to acquire OAuth2 token for destination.")
+            sys.exit(1)
+        print("Destination OAuth2 token acquired successfully.\n")
+
+    # Use a list (not tuple) so token updates propagate to worker threads
+    dest_conf = [args.dest_host, args.dest_user, args.dest_pass, dest_oauth2_token]
+
+    # OAuth2 context for thread-safe token refresh (None if not using OAuth2)
+    oauth2_ctx = {
+        "provider": dest_oauth2_provider, "client_id": args.dest_client_id,
+        "email": args.dest_user, "client_secret": args.dest_client_secret,
+    } if dest_use_oauth2 else None
 
     # Expand path
     local_path = os.path.expanduser(args.src_path)
@@ -692,6 +742,7 @@ def main():
     print(f"Source Path     : {local_path}")
     print(f"Destination Host: {args.dest_host}")
     print(f"Destination User: {args.dest_user}")
+    print(f"Dest Auth       : {'OAuth2/' + dest_oauth2_provider + ' (XOAUTH2)' if dest_use_oauth2 else 'Basic (password)'}")
     print(f"Workers         : {args.workers}")
     if args.gmail_mode:
         print("Mode            : Gmail Restore with Labels + Flags")
@@ -713,14 +764,14 @@ def main():
 
         if args.gmail_mode:
             # Special Gmail mode
-            restore_gmail_with_labels(local_path, dest_conf, manifest, apply_flags)
+            restore_gmail_with_labels(local_path, dest_conf, manifest, apply_flags, oauth2_ctx)
         elif args.folder:
             # Restore specific folder
             folder_path = os.path.join(local_path, args.folder.replace("/", os.sep))
             if not os.path.exists(folder_path):
                 print(f"Error: Folder not found: {folder_path}")
                 sys.exit(1)
-            restore_folder(args.folder, folder_path, dest_conf, manifest, apply_labels, apply_flags)
+            restore_folder(args.folder, folder_path, dest_conf, manifest, apply_labels, apply_flags, oauth2_ctx)
         else:
             # Restore all folders
             folders = get_backup_folders(local_path)
@@ -740,6 +791,7 @@ def main():
                     manifest,
                     apply_labels,
                     apply_flags,
+                    oauth2_ctx,
                 )
 
         print("\nRestore completed successfully.")
