@@ -107,7 +107,7 @@ def get_thread_connections(src_conf, dest_conf, src_oauth2_ctx=None, dest_oauth2
 
 
 def process_batch(uids, folder_name, src_conf, dest_conf, delete_from_source, trash_folder=None,
-                   src_oauth2_ctx=None, dest_oauth2_ctx=None):
+                   src_oauth2_ctx=None, dest_oauth2_ctx=None, dest_msg_ids=None):
     src, dest = get_thread_connections(src_conf, dest_conf, src_oauth2_ctx, dest_oauth2_ctx)
     if not src or not dest:
         safe_print("Error: Could not establish connections in worker thread.")
@@ -130,7 +130,9 @@ def process_batch(uids, folder_name, src_conf, dest_conf, delete_from_source, tr
             size_str = f"{size / 1024:.1f}KB" if size else "0KB"
 
             is_duplicate = False
-            if msg_id:
+            if msg_id and dest_msg_ids is not None:
+                is_duplicate = msg_id in dest_msg_ids
+            elif msg_id:
                 is_duplicate = imap_common.message_exists_in_folder(dest, msg_id)
 
             if is_duplicate:
@@ -225,7 +227,10 @@ def migrate_folder(src, dest, folder_name, delete_from_source, src_conf, dest_co
         safe_print(f"Folder {folder_name} is empty.")
         return
 
-    safe_print(f"Found {total} messages. Starting parallel migration...")
+    # Pre-fetch destination Message-IDs for fast duplicate detection
+    safe_print(f"Pre-fetching destination Message-IDs for {folder_name}...")
+    dest_msg_ids = imap_common.get_message_ids_in_folder(dest)
+    safe_print(f"Found {total} source / {len(dest_msg_ids)} destination messages. Starting parallel migration...")
 
     # Create batches
     uid_batches = [uids[i : i + BATCH_SIZE] for i in range(0, len(uids), BATCH_SIZE)]
@@ -237,7 +242,7 @@ def migrate_folder(src, dest, folder_name, delete_from_source, src_conf, dest_co
             futures.append(
                 executor.submit(
                     process_batch, batch, folder_name, src_conf, dest_conf, delete_from_source, trash_folder,
-                    src_oauth2_ctx, dest_oauth2_ctx,
+                    src_oauth2_ctx, dest_oauth2_ctx, dest_msg_ids,
                 )
             )
 

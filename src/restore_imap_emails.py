@@ -244,13 +244,14 @@ def email_exists_in_folder(imap_conn, message_id):
         return False
 
 
-def upload_email(dest, folder_name, raw_content, date_str, message_id, subject, flags=None):
+def upload_email(dest, folder_name, raw_content, date_str, message_id, subject, flags=None, dest_msg_ids=None):
     """
     Upload a single email to the destination folder.
     Returns True on success, False on failure.
 
     Args:
         flags: Optional string of IMAP flags like "\\Seen" for read emails.
+        dest_msg_ids: Optional pre-fetched set of Message-IDs for fast duplicate check.
     """
     try:
         # Ensure folder exists
@@ -265,8 +266,12 @@ def upload_email(dest, folder_name, raw_content, date_str, message_id, subject, 
 
         # Check for duplicates
         size = len(raw_content)
-        if message_id and email_exists_in_folder(dest, message_id):
-            return False  # Already exists
+        if message_id:
+            if dest_msg_ids is not None:
+                if message_id in dest_msg_ids:
+                    return False  # Already exists
+            elif email_exists_in_folder(dest, message_id):
+                return False  # Already exists
 
         # Upload with original date and flags
         resp, _ = dest.append(f'"{folder_name}"', flags, date_str, raw_content)
@@ -305,7 +310,8 @@ def label_to_folder(label):
         return label
 
 
-def process_restore_batch(eml_files, folder_name, dest_conf, manifest, apply_labels, apply_flags):
+def process_restore_batch(eml_files, folder_name, dest_conf, manifest, apply_labels, apply_flags,
+                          dest_msg_ids=None):
     """
     Process a batch of .eml files for restoration.
 
@@ -314,6 +320,7 @@ def process_restore_batch(eml_files, folder_name, dest_conf, manifest, apply_lab
         manifest: Combined manifest with labels and/or flags
         apply_labels: Whether to apply Gmail labels from manifest
         apply_flags: Whether to apply IMAP flags from manifest
+        dest_msg_ids: Optional pre-fetched set of Message-IDs for fast duplicate check
     """
     dest = get_thread_connection(dest_conf)
     if not dest:
@@ -369,7 +376,10 @@ def process_restore_batch(eml_files, folder_name, dest_conf, manifest, apply_lab
                 remaining_labels = labels
 
             # Upload to target folder (or check if exists)
-            uploaded = upload_email(dest, target_folder, raw_content, date_str, message_id, display_subject, flags)
+            # Only use pre-fetched IDs when target matches the pre-fetched folder
+            batch_ids = dest_msg_ids if not gmail_mode else None
+            uploaded = upload_email(dest, target_folder, raw_content, date_str, message_id, display_subject, flags,
+                                    batch_ids)
 
             if not uploaded:
                 safe_print(f"[{target_folder}] SKIP (exists) | {size_str:<8} | {display_subject}")
@@ -433,6 +443,25 @@ def restore_folder(folder_name, local_folder_path, dest_conf, manifest, apply_la
 
     safe_print(f"Found {len(eml_files)} emails to restore.")
 
+    # Pre-fetch destination Message-IDs for fast duplicate detection
+    dest_msg_ids = set()
+    try:
+        dest_tmp = imap_common.get_imap_connection(*dest_conf)
+        if dest_tmp:
+            # Ensure folder exists before selecting
+            if folder_name.upper() != "INBOX":
+                try:
+                    dest_tmp.create(f'"{folder_name}"')
+                except Exception:
+                    pass
+            dest_tmp.select(f'"{folder_name}"')
+            dest_msg_ids = imap_common.get_message_ids_in_folder(dest_tmp)
+            dest_tmp.logout()
+    except Exception:
+        dest_msg_ids = set()
+
+    safe_print(f"{len(dest_msg_ids)} existing messages in destination. Starting parallel restore...")
+
     # Create batches
     batches = [eml_files[i : i + BATCH_SIZE] for i in range(0, len(eml_files), BATCH_SIZE)]
 
@@ -448,6 +477,7 @@ def restore_folder(folder_name, local_folder_path, dest_conf, manifest, apply_la
                     manifest,
                     apply_labels,
                     apply_flags,
+                    dest_msg_ids,
                 )
             )
 

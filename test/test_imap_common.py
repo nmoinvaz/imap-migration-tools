@@ -312,6 +312,75 @@ class TestMessageExistsInFolder:
         assert result is False
 
 
+class TestGetMessageIdsInFolder:
+    """Tests for get_message_ids_in_folder function."""
+
+    def test_empty_folder(self):
+        """Test returns empty set when folder has no messages."""
+        mock_conn = Mock()
+        mock_conn.uid.return_value = ("OK", [b""])
+
+        result = imap_common.get_message_ids_in_folder(mock_conn)
+        assert result == set()
+
+    def test_single_message(self):
+        """Test returns set with one Message-ID."""
+        mock_conn = Mock()
+        mock_conn.uid.side_effect = [
+            ("OK", [b"1"]),  # search
+            ("OK", [(b"1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {30}",
+                     b"Message-ID: <abc@example.com>\r\n\r\n"), b")"]),  # fetch
+        ]
+
+        result = imap_common.get_message_ids_in_folder(mock_conn)
+        assert result == {"<abc@example.com>"}
+
+    def test_multiple_messages(self):
+        """Test returns set with multiple Message-IDs."""
+        mock_conn = Mock()
+        mock_conn.uid.side_effect = [
+            ("OK", [b"1 2 3"]),  # search
+            ("OK", [
+                (b"1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {30}",
+                 b"Message-ID: <a@example.com>\r\n\r\n"), b")",
+                (b"2 (BODY[HEADER.FIELDS (MESSAGE-ID)] {30}",
+                 b"Message-ID: <b@example.com>\r\n\r\n"), b")",
+                (b"3 (BODY[HEADER.FIELDS (MESSAGE-ID)] {30}",
+                 b"Message-ID: <c@example.com>\r\n\r\n"), b")",
+            ]),  # fetch
+        ]
+
+        result = imap_common.get_message_ids_in_folder(mock_conn)
+        assert result == {"<a@example.com>", "<b@example.com>", "<c@example.com>"}
+
+    def test_search_error(self):
+        """Test returns empty set on IMAP search error."""
+        mock_conn = Mock()
+        mock_conn.uid.return_value = ("NO", [])
+
+        result = imap_common.get_message_ids_in_folder(mock_conn)
+        assert result == set()
+
+    def test_search_exception(self):
+        """Test returns empty set when search raises an exception."""
+        mock_conn = Mock()
+        mock_conn.uid.side_effect = Exception("Connection error")
+
+        result = imap_common.get_message_ids_in_folder(mock_conn)
+        assert result == set()
+
+    def test_fetch_error(self):
+        """Test returns empty set when fetch fails."""
+        mock_conn = Mock()
+        mock_conn.uid.side_effect = [
+            ("OK", [b"1"]),  # search succeeds
+            ("NO", []),  # fetch fails
+        ]
+
+        result = imap_common.get_message_ids_in_folder(mock_conn)
+        assert result == set()
+
+
 class TestGetMsgDetails:
     """Tests for get_msg_details function."""
 
