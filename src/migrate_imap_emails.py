@@ -750,6 +750,9 @@ def main():
     DELETE_SOURCE = args.delete
     DEST_DELETE = args.dest_delete
 
+    src_use_oauth2 = bool(args.src_client_id)
+    dest_use_oauth2 = bool(args.dest_client_id)
+
     gmail_mode = bool(args.gmail_mode)
     preserve_flags = bool(args.preserve_flags) or gmail_mode
     preserve_labels = bool(args.preserve_labels) or gmail_mode
@@ -775,14 +778,12 @@ def main():
         missing_vars.append("SRC_IMAP_HOST")
     if not SRC_USER:
         missing_vars.append("SRC_IMAP_USERNAME")
-    src_use_oauth2 = bool(args.src_client_id)
     if not SRC_PASS and not src_use_oauth2:
         missing_vars.append("SRC_IMAP_PASSWORD")
     if not DEST_HOST:
         missing_vars.append("DEST_IMAP_HOST")
     if not DEST_USER:
         missing_vars.append("DEST_IMAP_USERNAME")
-    dest_use_oauth2 = bool(args.dest_client_id)
     if not DEST_PASS and not dest_use_oauth2:
         missing_vars.append("DEST_IMAP_PASSWORD")
 

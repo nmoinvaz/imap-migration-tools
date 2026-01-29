@@ -163,17 +163,21 @@ def main():
     src_is_local = bool(args.src_path)
     dest_is_local = bool(args.dest_path)
 
+    # Determine if OAuth2 should be used (client_id provided and not local)
+    src_use_oauth2 = bool(args.src_client_id) and not src_is_local
+    dest_use_oauth2 = bool(args.dest_client_id) and not dest_is_local
+
     # Acquire OAuth2 tokens if configured
     src_oauth2_token = None
     src_oauth2_provider = None
     if src_use_oauth2:
-        src_oauth2_provider = imap_oauth2.detect_oauth2_provider(SRC_HOST)
+        src_oauth2_provider = imap_oauth2.detect_oauth2_provider(args.src_host)
         if not src_oauth2_provider:
-            print(f"Error: Could not detect OAuth2 provider from host '{SRC_HOST}'.")
+            print(f"Error: Could not detect OAuth2 provider from host '{args.src_host}'.")
             sys.exit(1)
         print(f"Acquiring OAuth2 token for source ({src_oauth2_provider})...")
         src_oauth2_token = imap_oauth2.acquire_oauth2_token_for_provider(
-            src_oauth2_provider, args.src_client_id, SRC_USER, args.src_client_secret
+            src_oauth2_provider, args.src_client_id, args.src_user, args.src_client_secret
         )
         if not src_oauth2_token:
             print("Error: Failed to acquire OAuth2 token for source.")
@@ -183,13 +187,13 @@ def main():
     dest_oauth2_token = None
     dest_oauth2_provider = None
     if dest_use_oauth2:
-        dest_oauth2_provider = imap_oauth2.detect_oauth2_provider(DEST_HOST)
+        dest_oauth2_provider = imap_oauth2.detect_oauth2_provider(args.dest_host)
         if not dest_oauth2_provider:
-            print(f"Error: Could not detect OAuth2 provider from host '{DEST_HOST}'.")
+            print(f"Error: Could not detect OAuth2 provider from host '{args.dest_host}'.")
             sys.exit(1)
         print(f"Acquiring OAuth2 token for destination ({dest_oauth2_provider})...")
         dest_oauth2_token = imap_oauth2.acquire_oauth2_token_for_provider(
-            dest_oauth2_provider, args.dest_client_id, DEST_USER, args.dest_client_secret
+            dest_oauth2_provider, args.dest_client_id, args.dest_user, args.dest_client_secret
         )
         if not dest_oauth2_token:
             print("Error: Failed to acquire OAuth2 token for destination.")

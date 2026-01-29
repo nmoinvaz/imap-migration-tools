@@ -715,13 +715,14 @@ def main():
 
     args = parser.parse_args()
 
+    use_oauth2 = bool(args.src_client_id)
+
     # Validate
     missing = []
     if not args.src_host:
         missing.append("SRC_IMAP_HOST")
     if not args.src_user:
         missing.append("SRC_IMAP_USERNAME")
-    use_oauth2 = bool(args.src_client_id)
     if not args.src_pass and not use_oauth2:
         missing.append("SRC_IMAP_PASSWORD or OAuth2 credentials")
 
@@ -782,7 +783,7 @@ def main():
     print("\n--- Configuration Summary ---")
     print(f"Source Host     : {args.src_host}")
     print(f"Source User     : {args.src_user}")
-    print(f"Auth Method     : {'OAuth2/' + oauth2_provider + ' (XOAUTH2)' if use_oauth2 else 'Basic (password)'}")
+    print(f"Source Auth     : {'OAuth2/' + oauth2_provider + ' (XOAUTH2)' if use_oauth2 else 'Basic (password)'}")
     print(f"Destination Path: {local_path}")
     if args.gmail_mode:
         print("Mode            : Gmail Backup (All Mail + Labels + Flags)")

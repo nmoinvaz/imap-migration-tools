@@ -208,6 +208,7 @@ if __name__ == "__main__":
     PASSWORD = args.password
 
     use_oauth2 = bool(args.client_id)
+
     if not IMAP_SERVER or not USERNAME or (not PASSWORD and not use_oauth2):
         print("Error: Missing credentials.")
         sys.exit(1)
@@ -232,7 +233,7 @@ if __name__ == "__main__":
     print("\n--- Configuration Summary ---")
     print(f"Host            : {IMAP_SERVER}")
     print(f"User            : {USERNAME}")
-    print(f"Auth Method     : {'OAuth2/' + oauth2_provider + ' (XOAUTH2)' if use_oauth2 else 'Basic (password)'}")
+    print(f"Auth            : {'OAuth2/' + oauth2_provider + ' (XOAUTH2)' if use_oauth2 else 'Basic (password)'}")
     print("-----------------------------\n")
 
     count_emails(IMAP_SERVER, USERNAME, PASSWORD, oauth2_token)

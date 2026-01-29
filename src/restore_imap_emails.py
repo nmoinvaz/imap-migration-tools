@@ -775,6 +775,8 @@ def main():
 
     args = parser.parse_args()
 
+    dest_use_oauth2 = bool(args.dest_client_id)
+
     # Validate
     dest_use_oauth2 = bool(args.dest_client_id)
     missing = []
