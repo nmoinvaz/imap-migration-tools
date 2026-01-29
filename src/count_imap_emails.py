@@ -24,6 +24,7 @@ import os
 import sys
 
 import imap_common
+import imap_oauth2
 
 
 def count_emails(imap_server, username, password=None, oauth2_token=None):
@@ -116,12 +117,12 @@ if __name__ == "__main__":
     oauth2_token = None
     oauth2_provider = None
     if use_oauth2:
-        oauth2_provider = imap_common.detect_oauth2_provider(IMAP_SERVER)
+        oauth2_provider = imap_oauth2.detect_oauth2_provider(IMAP_SERVER)
         if not oauth2_provider:
             print(f"Error: Could not detect OAuth2 provider from host '{IMAP_SERVER}'.")
             sys.exit(1)
         print(f"Acquiring OAuth2 token ({oauth2_provider})...")
-        oauth2_token = imap_common.acquire_oauth2_token_for_provider(
+        oauth2_token = imap_oauth2.acquire_oauth2_token_for_provider(
             oauth2_provider, args.client_id, USERNAME, args.client_secret
         )
         if not oauth2_token:

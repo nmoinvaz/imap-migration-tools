@@ -33,6 +33,7 @@ import sys
 import threading
 
 import imap_common
+import imap_oauth2
 
 # Defaults
 MAX_WORKERS = 10
@@ -71,7 +72,7 @@ def get_thread_connection(src_conf, oauth2_ctx=None):
         # If reconnection failed (possibly expired token), try refreshing
         if thread_local.src is None and oauth2_ctx:
             old_token = src_conf[3]
-            imap_common.refresh_oauth2_token(
+            imap_oauth2.refresh_oauth2_token(
                 oauth2_ctx["provider"], oauth2_ctx["client_id"],
                 oauth2_ctx["email"], oauth2_ctx["client_secret"],
                 src_conf, old_token,
@@ -658,12 +659,12 @@ def main():
     oauth2_token = None
     oauth2_provider = None
     if use_oauth2:
-        oauth2_provider = imap_common.detect_oauth2_provider(args.src_host)
+        oauth2_provider = imap_oauth2.detect_oauth2_provider(args.src_host)
         if not oauth2_provider:
             print(f"Error: Could not detect OAuth2 provider from host '{args.src_host}'.")
             sys.exit(1)
         print(f"Acquiring OAuth2 token ({oauth2_provider})...")
-        oauth2_token = imap_common.acquire_oauth2_token_for_provider(
+        oauth2_token = imap_oauth2.acquire_oauth2_token_for_provider(
             oauth2_provider, args.src_client_id, args.src_user, args.src_client_secret
         )
         if not oauth2_token:
@@ -752,7 +753,7 @@ def main():
                 except Exception:
                     if oauth2_ctx:
                         safe_print("Refreshing OAuth2 token...")
-                        imap_common.refresh_oauth2_token(
+                        imap_oauth2.refresh_oauth2_token(
                             oauth2_ctx["provider"], oauth2_ctx["client_id"],
                             oauth2_ctx["email"], oauth2_ctx["client_secret"],
                             src_conf, src_conf[3],

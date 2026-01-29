@@ -25,6 +25,7 @@ import os
 import sys
 
 import imap_common
+import imap_oauth2
 
 
 def get_email_count(conn, folder_name):
@@ -90,12 +91,12 @@ def main():
     src_oauth2_token = None
     src_oauth2_provider = None
     if src_use_oauth2:
-        src_oauth2_provider = imap_common.detect_oauth2_provider(SRC_HOST)
+        src_oauth2_provider = imap_oauth2.detect_oauth2_provider(SRC_HOST)
         if not src_oauth2_provider:
             print(f"Error: Could not detect OAuth2 provider from host '{SRC_HOST}'.")
             sys.exit(1)
         print(f"Acquiring OAuth2 token for source ({src_oauth2_provider})...")
-        src_oauth2_token = imap_common.acquire_oauth2_token_for_provider(
+        src_oauth2_token = imap_oauth2.acquire_oauth2_token_for_provider(
             src_oauth2_provider, args.src_client_id, SRC_USER, args.src_client_secret
         )
         if not src_oauth2_token:
@@ -106,12 +107,12 @@ def main():
     dest_oauth2_token = None
     dest_oauth2_provider = None
     if dest_use_oauth2:
-        dest_oauth2_provider = imap_common.detect_oauth2_provider(DEST_HOST)
+        dest_oauth2_provider = imap_oauth2.detect_oauth2_provider(DEST_HOST)
         if not dest_oauth2_provider:
             print(f"Error: Could not detect OAuth2 provider from host '{DEST_HOST}'.")
             sys.exit(1)
         print(f"Acquiring OAuth2 token for destination ({dest_oauth2_provider})...")
-        dest_oauth2_token = imap_common.acquire_oauth2_token_for_provider(
+        dest_oauth2_token = imap_oauth2.acquire_oauth2_token_for_provider(
             dest_oauth2_provider, args.dest_client_id, DEST_USER, args.dest_client_secret
         )
         if not dest_oauth2_token:
