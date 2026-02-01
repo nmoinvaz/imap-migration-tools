@@ -215,11 +215,13 @@ def parse_eml_file(file_path):
         with open(file_path, "rb") as f:
             raw_content = f.read()
 
-        parser = BytesParser(policy=policy.default)
+        # Use compat32 to preserve raw headers with continuation lines
+        parser = BytesParser(policy=policy.compat32)
         msg = parser.parsebytes(raw_content, headersonly=True)
 
-        message_id = msg.get("Message-ID", "").strip()
-        subject = msg.get("Subject", "(No Subject)")
+        message_id = imap_common.decode_message_id(msg.get("Message-ID"))
+        raw_subject = msg.get("Subject")
+        subject = imap_common.decode_mime_header(raw_subject) if raw_subject else "(No Subject)"
         date_header = msg.get("Date")
 
         # Parse date for IMAP INTERNALDATE
