@@ -545,22 +545,8 @@ def restore_folder(
             log_fn=safe_print,
         )
 
-    # Incremental mode uses cached Message-IDs to skip already-processed emails.
-    existing_dest_msg_ids_by_folder: Optional[dict[str, set[str]]] = {folder_name: set()}
+    existing_dest_msg_ids_by_folder: Optional[dict[str, set[str]]] = {}
     existing_dest_msg_ids_lock: Optional[threading.Lock] = threading.Lock()
-    try:
-        existing_dest_msg_ids_by_folder[folder_name] = restore_cache.get_cached_message_ids(
-            cache_data,
-            cache_lock,
-            dest_conf["host"],
-            dest_conf["user"],
-            folder_name,
-        )
-        safe_print(f"Cache has {len(existing_dest_msg_ids_by_folder[folder_name])} Message-IDs for this folder.")
-    except Exception as e:
-        # Fall back to an empty cache for this folder if reading cached Message-IDs fails.
-        safe_print(f"Warning: Failed to load cached Message-IDs for folder '{folder_name}': {e}")
-        existing_dest_msg_ids_by_folder[folder_name] = set()
 
     # If dest_delete enabled, get local Message-IDs for comparison
     local_msg_ids = None
@@ -569,34 +555,32 @@ def restore_folder(
         local_msg_ids = get_local_message_ids(local_folder_path)
         safe_print(f"Found {len(local_msg_ids)} unique Message-IDs in local backup.")
 
-    # Pre-fetch destination Message-IDs and filter duplicates (non-Gmail mode only)
+    # Pre-fetch destination Message-IDs and filter duplicates (non-Gmail mode only).
+    # Uses _load_folder_msg_ids() which consolidates cache loading, folder
+    # creation, SELECT, and Message-ID fetching into a single call.
     gmail_mode = folder_name == "__GMAIL_MODE__"
     files_to_restore = eml_files
 
     if not gmail_mode:
-        dest_msg_ids = set()
         try:
             dest_tmp = imap_common.get_imap_connection_from_conf(dest_conf)
             if dest_tmp:
-                # Ensure folder exists before selecting
-                if folder_name.upper() != "INBOX":
-                    try:
-                        dest_tmp.create(f'"{folder_name}"')
-                    except Exception:
-                        pass
-                dest_tmp.select(f'"{folder_name}"')
-                dest_msg_ids = set(imap_common.get_message_ids_in_folder(dest_tmp).values())
+                _load_folder_msg_ids(
+                    dest_tmp,
+                    folder_name,
+                    existing_dest_msg_ids_by_folder,
+                    existing_dest_msg_ids_lock,
+                    cache_data,
+                    cache_lock,
+                    dest_conf.get("host"),
+                    dest_conf.get("user"),
+                )
                 dest_tmp.logout()
         except Exception:
-            dest_msg_ids = set()
+            pass
 
+        dest_msg_ids = existing_dest_msg_ids_by_folder.get(folder_name, set())
         safe_print(f"{len(dest_msg_ids)} existing messages in destination.")
-
-        # Merge server-fetched IDs into the shared set so batch workers can
-        # skip per-message SEARCH commands (they already know what exists).
-        if dest_msg_ids:
-            with existing_dest_msg_ids_lock:
-                existing_dest_msg_ids_by_folder[folder_name].update(dest_msg_ids)
 
         # Pre-filter files to skip duplicates
         if dest_msg_ids:
