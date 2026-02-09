@@ -20,6 +20,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
 
 import imap_common
+import imap_pool
 import migrate_imap_emails
 from conftest import temp_argv, temp_env
 
@@ -413,15 +414,21 @@ class TestMigrateErrorHandling:
         dest_conf = {"host": env["DEST_IMAP_HOST"], "user": "dest_user", "password": "p"}
 
         with patch.object(imaplib.IMAP4, "select", raise_select), temp_env(env):
-            migrate_imap_emails.process_batch(
-                [b"1"],
-                "INBOX",
-                src_conf,
-                dest_conf,
-                delete_from_source=False,
-                preserve_flags=False,
-                gmail_mode=False,
-            )
+            src_pool = imap_pool.ConnectionPool(src_conf, max_size=1)
+            dest_pool = imap_pool.ConnectionPool(dest_conf, max_size=1)
+            try:
+                migrate_imap_emails.process_batch(
+                    [b"1"],
+                    "INBOX",
+                    src_pool,
+                    dest_pool,
+                    delete_from_source=False,
+                    preserve_flags=False,
+                    gmail_mode=False,
+                )
+            finally:
+                src_pool.shutdown()
+                dest_pool.shutdown()
 
     def test_fetch_error_in_worker(self, mock_server_factory):
         """Test error handling when fetching message details fails."""
@@ -756,15 +763,23 @@ class TestDestDeleteFunctionality:
         migrate_imap_emails.MAX_WORKERS = 1
         migrate_imap_emails.BATCH_SIZE = 1
 
-        migrate_imap_emails.migrate_folder(
-            src,
-            dest,
-            "INBOX",
-            False,
-            {"host": "localhost", "user": "src_user", "password": "p"},
-            {"host": "localhost", "user": "dest_user", "password": "p"},
-            dest_delete=True,
-        )
+        src_conf = {"host": "localhost", "user": "src_user", "password": "p"}
+        dest_conf = {"host": "localhost", "user": "dest_user", "password": "p"}
+        src_pool = imap_pool.ConnectionPool(src_conf, max_size=1)
+        dest_pool = imap_pool.ConnectionPool(dest_conf, max_size=1)
+        try:
+            migrate_imap_emails.migrate_folder(
+                src,
+                dest,
+                "INBOX",
+                False,
+                src_pool,
+                dest_pool,
+                dest_delete=True,
+            )
+        finally:
+            src_pool.shutdown()
+            dest_pool.shutdown()
 
         assert len(dest_server.folders["INBOX"]) == 1
         assert b"Message-ID: <keep@test>" in dest_server.folders["INBOX"][0]["content"]

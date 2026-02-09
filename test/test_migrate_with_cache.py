@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
 
 import imap_common
+import imap_pool
 import imap_session
 import migrate_imap_emails
 import restore_cache
@@ -167,32 +168,45 @@ class TestMigrationCache:
         src.login("src", "p")
         dest.login("dest", "p")
 
+        mock_conn_fn = make_mock_connection(p1, p2, src_user="src", dest_user="dest")
+
+        def ensure_conn_side_effect(conn, conf):
+            if conn is not None:
+                return conn
+            return mock_conn_fn(conf["host"], conf["user"], conf.get("password"))
+
         with (
-            patch("imap_common.get_imap_connection", make_mock_connection(p1, p2)),
+            patch("imap_common.get_imap_connection", mock_conn_fn),
             patch.object(
                 imap_common,
                 "load_progress_cache",
                 side_effect=RuntimeError("boom"),
             ),
-            patch.object(
-                imap_session, "get_thread_connection", lambda _store, key, _conf: src if key == "src" else dest
-            ),
+            patch.object(imap_session, "ensure_connection", side_effect=ensure_conn_side_effect),
         ):
             migrate_imap_emails.MAX_WORKERS = 1
             migrate_imap_emails.BATCH_SIZE = 1
 
-            migrate_imap_emails.migrate_folder(
-                src,
-                dest,
-                "INBOX",
-                False,
-                {"host": "localhost", "user": "src", "password": "p"},
-                {"host": "localhost", "user": "dest", "password": "p"},
-                progress_cache_path=str(tmp_path / "cache"),
-                progress_cache_file=None,
-                progress_cache_data=None,
-                progress_cache_lock=None,
-            )
+            src_conf = {"host": "localhost", "user": "src", "password": "p"}
+            dest_conf = {"host": "localhost", "user": "dest", "password": "p"}
+            src_pool = imap_pool.ConnectionPool(src_conf, max_size=1)
+            dest_pool = imap_pool.ConnectionPool(dest_conf, max_size=1)
+            try:
+                migrate_imap_emails.migrate_folder(
+                    src,
+                    dest,
+                    "INBOX",
+                    False,
+                    src_pool,
+                    dest_pool,
+                    progress_cache_path=str(tmp_path / "cache"),
+                    progress_cache_file=None,
+                    progress_cache_data=None,
+                    progress_cache_lock=None,
+                )
+            finally:
+                src_pool.shutdown()
+                dest_pool.shutdown()
 
         captured = capsys.readouterr()
         assert "Warning: Failed to load cache" in captured.out
@@ -214,32 +228,45 @@ class TestMigrationCache:
         src.login("src", "p")
         dest.login("dest", "p")
 
+        mock_conn_fn = make_mock_connection(p1, p2, src_user="src", dest_user="dest")
+
+        def ensure_conn_side_effect(conn, conf):
+            if conn is not None:
+                return conn
+            return mock_conn_fn(conf["host"], conf["user"], conf.get("password"))
+
         with (
-            patch("imap_common.get_imap_connection", make_mock_connection(p1, p2)),
+            patch("imap_common.get_imap_connection", mock_conn_fn),
             patch.object(
                 restore_cache,
                 "get_cached_message_ids",
                 side_effect=RuntimeError("read fail"),
             ),
-            patch.object(
-                imap_session, "get_thread_connection", lambda _store, key, _conf: src if key == "src" else dest
-            ),
+            patch.object(imap_session, "ensure_connection", side_effect=ensure_conn_side_effect),
         ):
             migrate_imap_emails.MAX_WORKERS = 1
             migrate_imap_emails.BATCH_SIZE = 1
 
-            migrate_imap_emails.migrate_folder(
-                src,
-                dest,
-                "INBOX",
-                False,
-                {"host": "localhost", "user": "src", "password": "p"},
-                {"host": "localhost", "user": "dest", "password": "p"},
-                progress_cache_path=str(tmp_path / "cache"),
-                progress_cache_file=None,
-                progress_cache_data=None,
-                progress_cache_lock=None,
-            )
+            src_conf = {"host": "localhost", "user": "src", "password": "p"}
+            dest_conf = {"host": "localhost", "user": "dest", "password": "p"}
+            src_pool = imap_pool.ConnectionPool(src_conf, max_size=1)
+            dest_pool = imap_pool.ConnectionPool(dest_conf, max_size=1)
+            try:
+                migrate_imap_emails.migrate_folder(
+                    src,
+                    dest,
+                    "INBOX",
+                    False,
+                    src_pool,
+                    dest_pool,
+                    progress_cache_path=str(tmp_path / "cache"),
+                    progress_cache_file=None,
+                    progress_cache_data=None,
+                    progress_cache_lock=None,
+                )
+            finally:
+                src_pool.shutdown()
+                dest_pool.shutdown()
 
         captured = capsys.readouterr()
         assert "Warning: Failed to read cache for folder 'INBOX'" in captured.out

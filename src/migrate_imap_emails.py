@@ -48,7 +48,7 @@ Configuration (Environment Variables):
     PRESERVE_LABELS     : Set to "true" to preserve Gmail labels during migration. Default is "false".
     PRESERVE_FLAGS      : Set to "true" to preserve IMAP flags during migration. Default is "false".
     GMAIL_MODE          : Set to "true" for Gmail migration mode. Default is "false".
-    MAX_WORKERS         : Number of concurrent threads (default: 10).
+    MAX_WORKERS         : Number of concurrent threads (default: 4).
     BATCH_SIZE          : Number of emails to process in a batch per thread (default: 10).
 
 Usage Example:
@@ -133,6 +133,7 @@ from typing import Optional
 
 import imap_common
 import imap_oauth2
+import imap_pool
 import imap_session
 import provider_exchange
 import provider_gmail
@@ -140,11 +141,9 @@ import restore_cache
 
 # Configuration defaults
 DELETE_FROM_SOURCE_DEFAULT = False
-MAX_WORKERS = 10  # Initial default, updated in main
+MAX_WORKERS = 4  # Initial default, updated in main
 BATCH_SIZE = 10  # Initial default, updated in main
 
-# Thread-local storage for IMAP connections
-thread_local = threading.local()
 safe_print = imap_common.safe_print
 
 
@@ -366,11 +365,15 @@ def process_single_uid(
             return (True, src, dest, 0)
 
 
+class _AuthRetry(Exception):
+    """Raised inside a pool context to signal an auth error requiring reconnect."""
+
+
 def process_batch(
     uids,
     folder_name,
-    src_conf,
-    dest_conf,
+    src_pool,
+    dest_pool,
     delete_from_source,
     trash_folder=None,
     preserve_flags=False,
@@ -384,104 +387,76 @@ def process_batch(
     progress_cache_data: Optional[dict] = None,
     progress_cache_lock: Optional[threading.Lock] = None,
 ):
-    src = imap_session.get_thread_connection(thread_local, "src", src_conf)
-    dest = imap_session.get_thread_connection(thread_local, "dest", dest_conf)
-    if not src or not dest:
-        safe_print("Error: Could not establish connections in worker thread.")
-        return False, 0
-
-    try:
-        src.select(f'"{folder_name}"', readonly=False)
-    except Exception as e:
-        safe_print(f"Error selecting folder {folder_name} in worker: {e}")
-        return False, 0
-
-    if not gmail_mode:
-        try:
-            imap_common.ensure_folder_exists(dest, folder_name)
-            dest.select(f'"{folder_name}"')
-        except Exception as e:
-            safe_print(f"Error selecting folder {folder_name} in worker: {e}")
-            return False, 0
-
-    # Extract info for cache update if needed
-    dest_host = dest_conf.get("host")
-    dest_user = dest_conf.get("user")
-
+    dest_host = dest_pool.conf.get("host")
+    dest_user = dest_pool.conf.get("user")
+    remaining = list(uids)
+    max_retries = 2
     deleted_count = 0
     max_uid_processed = 0
 
-    for uid in uids:
-        uid_str = uid.decode("utf-8") if isinstance(uid, bytes) else str(uid)
-
-        # Track max UID seen in this batch
+    for attempt in range(max_retries):
         try:
-            uid_int = int(uid_str)
-            if uid_int > max_uid_processed:
-                max_uid_processed = uid_int
-        except ValueError:
-            pass
+            with src_pool.connection() as src, dest_pool.connection() as dest:
+                src.select(f'"{folder_name}"', readonly=False)
+                if not gmail_mode:
+                    imap_common.ensure_folder_exists(dest, folder_name)
+                    dest.select(f'"{folder_name}"')
 
-        max_retries = 2
+                while remaining:
+                    uid = remaining[0]
+                    uid_str = uid.decode("utf-8") if isinstance(uid, bytes) else str(uid)
 
-        for attempt in range(max_retries):
-            src, src_ok = imap_session.ensure_folder_session(src, src_conf, folder_name, readonly=False)
-            thread_local.src = src
-            if not src_ok:
-                safe_print(f"[{folder_name}] ERROR: Source connection/folder lost for UID {uid_str}")
-                return False, 0
+                    # Track max UID seen in this batch
+                    try:
+                        uid_int = int(uid_str)
+                        if uid_int > max_uid_processed:
+                            max_uid_processed = uid_int
+                    except ValueError:
+                        pass
 
-            if not gmail_mode:
-                dest, dest_ok = imap_session.ensure_folder_session(dest, dest_conf, folder_name, readonly=False)
-                thread_local.dest = dest
-                if not dest_ok:
-                    safe_print(f"[{folder_name}] ERROR: Dest connection/folder lost for UID {uid_str}")
-                    return False, 0
-            else:
-                dest = imap_session.ensure_connection(dest, dest_conf)
-                thread_local.dest = dest
-                if not dest:
-                    safe_print(f"[{folder_name}] ERROR: Dest connection lost for UID {uid_str}")
-                    return False, 0
+                    success, _src, _dest, deleted = process_single_uid(
+                        src,
+                        dest,
+                        uid,
+                        folder_name,
+                        delete_from_source,
+                        trash_folder,
+                        preserve_flags,
+                        gmail_mode,
+                        label_index,
+                        check_duplicate,
+                        full_migrate,
+                        existing_dest_msg_ids=existing_dest_msg_ids,
+                        existing_dest_msg_ids_lock=existing_dest_msg_ids_lock,
+                        progress_cache_path=progress_cache_path,
+                        progress_cache_data=progress_cache_data,
+                        progress_cache_lock=progress_cache_lock,
+                        dest_host=dest_host,
+                        dest_user=dest_user,
+                    )
+                    deleted_count += deleted
 
-            success, src, dest, deleted = process_single_uid(
-                src,
-                dest,
-                uid,
-                folder_name,
-                delete_from_source,
-                trash_folder,
-                preserve_flags,
-                gmail_mode,
-                label_index,
-                check_duplicate,
-                full_migrate,
-                existing_dest_msg_ids=existing_dest_msg_ids,
-                existing_dest_msg_ids_lock=existing_dest_msg_ids_lock,
-                progress_cache_path=progress_cache_path,
-                progress_cache_data=progress_cache_data,
-                progress_cache_lock=progress_cache_lock,
-                dest_host=dest_host,
-                dest_user=dest_user,
-            )
-            thread_local.src = src
-            thread_local.dest = dest
-            deleted_count += deleted
+                    if not success:
+                        raise _AuthRetry()
+                    remaining.pop(0)
 
-            if success:
-                break
+                if delete_from_source and deleted_count > 0:
+                    try:
+                        src.expunge()
+                        safe_print(f"[{folder_name}] Expunged {deleted_count} messages from batch.")
+                    except Exception as e:
+                        safe_print(f"[{folder_name}] ERROR Expunge: {e}")
+
+            break  # all done
+        except _AuthRetry:
             if attempt < max_retries - 1:
-                src = None
-                dest = None
-                thread_local.src = None
-                thread_local.dest = None
-
-    if delete_from_source and deleted_count > 0:
-        try:
-            src.expunge()
-            safe_print(f"[{folder_name}] Expunged {deleted_count} messages from batch.")
+                safe_print(f"[{folder_name}] Retrying batch after auth error...")
+                continue
+            return False, max_uid_processed
         except Exception as e:
-            safe_print(f"[{folder_name}] ERROR Expunge: {e}")
+            if remaining:
+                safe_print(f"[{folder_name}] Batch error: {e}")
+            return False, max_uid_processed
 
     return True, max_uid_processed
 
@@ -491,8 +466,8 @@ def migrate_folder(
     dest,
     folder_name,
     delete_from_source,
-    src_conf,
-    dest_conf,
+    src_pool,
+    dest_pool,
     trash_folder=None,
     dest_delete=False,
     preserve_flags=False,
@@ -509,6 +484,7 @@ def migrate_folder(
     # Load cache if provided
     existing_dest_msg_ids = None
     existing_dest_msg_ids_lock = None
+    dest_conf = dest_pool.conf
     dest_host = dest_conf.get("host")
     dest_user = dest_conf.get("user")
     cache_file = progress_cache_file
@@ -657,8 +633,8 @@ def migrate_folder(
                     process_batch,
                     batch,
                     folder_name,
-                    src_conf,
-                    dest_conf,
+                    src_pool,
+                    dest_pool,
                     delete_from_source,
                     trash_folder,
                     preserve_flags,
@@ -674,28 +650,33 @@ def migrate_folder(
                 )
             )
 
-        # Wait for all batches to complete and update watermark
-        should_update_watermark = True
+        # Wait for batches to complete (in any order) and track watermark
+        all_batches_ok = True
+        overall_max_uid = 0
 
-        for future in futures:
+        for future in concurrent.futures.as_completed(futures):
             try:
                 success, batch_max_uid = future.result()
                 if success:
-                    if should_update_watermark and current_validity and progress_cache_data and batch_max_uid > 0:
-                        restore_cache.record_source_progress(
-                            folder_name=folder_name,
-                            uid_validity=current_validity,
-                            last_uid=batch_max_uid,
-                            progress_cache_path=cache_file,
-                            progress_cache_data=progress_cache_data,
-                            progress_cache_lock=progress_cache_lock,
-                            log_fn=safe_print,
-                        )
+                    if batch_max_uid > overall_max_uid:
+                        overall_max_uid = batch_max_uid
                 else:
-                    should_update_watermark = False
+                    all_batches_ok = False
             except Exception as e:
                 safe_print(f"Batch Error: {e}")
-                should_update_watermark = False
+                all_batches_ok = False
+
+        # Only advance watermark if every batch succeeded
+        if all_batches_ok and overall_max_uid > 0 and current_validity and progress_cache_data:
+            restore_cache.record_source_progress(
+                folder_name=folder_name,
+                uid_validity=current_validity,
+                last_uid=overall_max_uid,
+                progress_cache_path=cache_file,
+                progress_cache_data=progress_cache_data,
+                progress_cache_lock=progress_cache_lock,
+                log_fn=safe_print,
+            )
     except KeyboardInterrupt:
         safe_print("\n\n!!! Migration interrupted by user. Shutting down threads... !!!\n")
         executor.shutdown(wait=False, cancel_futures=True)
@@ -842,7 +823,7 @@ def main():
     )
 
     parser.add_argument(
-        "--workers", type=int, default=int(os.getenv("MAX_WORKERS", 10)), help="Number of concurrent threads"
+        "--workers", type=int, default=int(os.getenv("MAX_WORKERS", 4)), help="Number of concurrent threads"
     )
     parser.add_argument("--batch", type=int, default=int(os.getenv("BATCH_SIZE", 10)), help="Batch size per thread")
 
@@ -979,100 +960,105 @@ def main():
             label_index = provider_gmail.build_gmail_label_index(src_main, safe_print)
             safe_print(f"Label index built for {len(label_index)} messages.")
 
-        if TARGET_FOLDER:
-            # Migration for specific folder
-            if DELETE_SOURCE and trash_folder and trash_folder == TARGET_FOLDER:
-                safe_print(
-                    f"Aborting: Cannot migrate Trash folder '{TARGET_FOLDER}' while --src-delete is enabled. This would create a loop."
-                )
-                sys.exit(1)
-
-            safe_print(f"Starting migration for single folder: {TARGET_FOLDER}")
-            # Verify folder exists first? imaplib usually handles select error if not found
-            migrate_folder(
-                src_main,
-                dest_main,
-                TARGET_FOLDER,
-                DELETE_SOURCE,
-                src_conf,
-                dest_conf,
-                trash_folder,
-                DEST_DELETE,
-                preserve_flags,
-                gmail_mode,
-                label_index,
-                progress_cache_path=migrate_cache,
-                full_migrate=full_migrate,
-                progress_cache_file=progress_cache_file,
-                progress_cache_data=progress_cache_data,
-                progress_cache_lock=progress_cache_lock,
-            )
-        else:
-            # Migration for all folders
-            if gmail_mode:
-                folders = imap_common.list_selectable_folders(src_main)
-                if provider_gmail.GMAIL_ALL_MAIL not in folders:
+        src_pool = imap_pool.ConnectionPool(src_conf, max_size=MAX_WORKERS)
+        dest_pool = imap_pool.ConnectionPool(dest_conf, max_size=MAX_WORKERS)
+        try:
+            if TARGET_FOLDER:
+                # Migration for specific folder
+                if DELETE_SOURCE and trash_folder and trash_folder == TARGET_FOLDER:
                     safe_print(
-                        "Warning: --gmail-mode requested but source does not have [Gmail]/All Mail. Falling back to normal folder migration."
+                        f"Aborting: Cannot migrate Trash folder '{TARGET_FOLDER}' while --src-delete is enabled. This would create a loop."
                     )
-                    gmail_mode = False
-                else:
-                    migrate_folder(
-                        src_main,
-                        dest_main,
-                        provider_gmail.GMAIL_ALL_MAIL,
-                        DELETE_SOURCE,
-                        src_conf,
-                        dest_conf,
-                        trash_folder,
-                        DEST_DELETE,
-                        preserve_flags,
-                        True,
-                        label_index,
-                        progress_cache_path=migrate_cache,
-                        full_migrate=full_migrate,
-                        progress_cache_file=progress_cache_file,
-                        progress_cache_data=progress_cache_data,
-                        progress_cache_lock=progress_cache_lock,
-                    )
+                    sys.exit(1)
 
-            if not gmail_mode:
-                folders = imap_common.list_selectable_folders(src_main)
-                for name in folders:
-                    if DELETE_SOURCE and trash_folder and name == trash_folder:
-                        safe_print(f"Skipping migration of Trash folder '{name}' (preventing circular migration).")
-                        continue
-                    if provider_exchange.is_special_folder(name):
-                        safe_print(f"Skipping Exchange system folder: {name}")
-                        continue
+                safe_print(f"Starting migration for single folder: {TARGET_FOLDER}")
+                migrate_folder(
+                    src_main,
+                    dest_main,
+                    TARGET_FOLDER,
+                    DELETE_SOURCE,
+                    src_pool,
+                    dest_pool,
+                    trash_folder,
+                    DEST_DELETE,
+                    preserve_flags,
+                    gmail_mode,
+                    label_index,
+                    progress_cache_path=migrate_cache,
+                    full_migrate=full_migrate,
+                    progress_cache_file=progress_cache_file,
+                    progress_cache_data=progress_cache_data,
+                    progress_cache_lock=progress_cache_lock,
+                )
+            else:
+                # Migration for all folders
+                if gmail_mode:
+                    folders = imap_common.list_selectable_folders(src_main)
+                    if provider_gmail.GMAIL_ALL_MAIL not in folders:
+                        safe_print(
+                            "Warning: --gmail-mode requested but source does not have [Gmail]/All Mail. Falling back to normal folder migration."
+                        )
+                        gmail_mode = False
+                    else:
+                        migrate_folder(
+                            src_main,
+                            dest_main,
+                            provider_gmail.GMAIL_ALL_MAIL,
+                            DELETE_SOURCE,
+                            src_pool,
+                            dest_pool,
+                            trash_folder,
+                            DEST_DELETE,
+                            preserve_flags,
+                            True,
+                            label_index,
+                            progress_cache_path=migrate_cache,
+                            full_migrate=full_migrate,
+                            progress_cache_file=progress_cache_file,
+                            progress_cache_data=progress_cache_data,
+                            progress_cache_lock=progress_cache_lock,
+                        )
 
-                    src_main = imap_session.ensure_connection(src_main, src_conf)
-                    if not src_main:
-                        safe_print("Fatal: Could not reconnect to source IMAP server. Aborting.")
-                        sys.exit(1)
-                    dest_main = imap_session.ensure_connection(dest_main, dest_conf)
-                    if not dest_main:
-                        safe_print("Fatal: Could not reconnect to destination IMAP server. Aborting.")
-                        sys.exit(1)
+                if not gmail_mode:
+                    folders = imap_common.list_selectable_folders(src_main)
+                    for name in folders:
+                        if DELETE_SOURCE and trash_folder and name == trash_folder:
+                            safe_print(f"Skipping migration of Trash folder '{name}' (preventing circular migration).")
+                            continue
+                        if provider_exchange.is_special_folder(name):
+                            safe_print(f"Skipping Exchange system folder: {name}")
+                            continue
 
-                    migrate_folder(
-                        src_main,
-                        dest_main,
-                        name,
-                        DELETE_SOURCE,
-                        src_conf,
-                        dest_conf,
-                        trash_folder,
-                        DEST_DELETE,
-                        preserve_flags,
-                        False,
-                        None,
-                        progress_cache_path=migrate_cache,
-                        full_migrate=full_migrate,
-                        progress_cache_file=progress_cache_file,
-                        progress_cache_data=progress_cache_data,
-                        progress_cache_lock=progress_cache_lock,
-                    )
+                        src_main = imap_session.ensure_connection(src_main, src_conf)
+                        if not src_main:
+                            safe_print("Fatal: Could not reconnect to source IMAP server. Aborting.")
+                            sys.exit(1)
+                        dest_main = imap_session.ensure_connection(dest_main, dest_conf)
+                        if not dest_main:
+                            safe_print("Fatal: Could not reconnect to destination IMAP server. Aborting.")
+                            sys.exit(1)
+
+                        migrate_folder(
+                            src_main,
+                            dest_main,
+                            name,
+                            DELETE_SOURCE,
+                            src_pool,
+                            dest_pool,
+                            trash_folder,
+                            DEST_DELETE,
+                            preserve_flags,
+                            False,
+                            None,
+                            progress_cache_path=migrate_cache,
+                            full_migrate=full_migrate,
+                            progress_cache_file=progress_cache_file,
+                            progress_cache_data=progress_cache_data,
+                            progress_cache_lock=progress_cache_lock,
+                        )
+        finally:
+            src_pool.shutdown()
+            dest_pool.shutdown()
 
         src_main.logout()
         dest_main.logout()

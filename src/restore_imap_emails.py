@@ -60,6 +60,7 @@ from typing import Optional
 
 import imap_common
 import imap_oauth2
+import imap_pool
 import imap_session
 import provider_gmail
 import restore_cache
@@ -77,8 +78,6 @@ class UploadResult(Enum):
 MAX_WORKERS = 4  # Lower default for restore to avoid rate limits
 BATCH_SIZE = 10
 
-# Thread-local storage
-thread_local = threading.local()
 safe_print = imap_common.safe_print
 
 
@@ -272,7 +271,7 @@ def get_labels_from_manifest(manifest, message_id):
 def process_restore_batch(
     eml_files,
     folder_name,
-    dest_conf,
+    dest_pool,
     manifest,
     apply_labels,
     apply_flags,
@@ -290,186 +289,177 @@ def process_restore_batch(
 
     Args:
         folder_name: Target folder, or "__GMAIL_MODE__" for per-email folder selection
+        dest_pool: ConnectionPool for destination server
         manifest: Combined manifest with labels and/or flags
         apply_labels: Whether to apply Gmail labels from manifest
         apply_flags: Whether to apply IMAP flags from manifest
     """
-    dest = imap_session.get_thread_connection(thread_local, "dest", dest_conf)
-    if not dest:
-        safe_print("Error: Could not establish connection for batch.")
-        return
-
     gmail_mode = folder_name == "__GMAIL_MODE__"
 
-    for file_path, filename in eml_files:
-        # Proactively refresh token if needed
-        dest = imap_session.get_thread_connection(thread_local, "dest", dest_conf)
-        if not dest:
-            safe_print(f"ERROR: Connection lost for {filename}")
-            return
+    with dest_pool.connection() as dest:
+        for file_path, filename in eml_files:
+            try:
+                message_id, date_str, raw_content, subject = parse_eml_file(file_path)
+                if raw_content is None:
+                    continue  # No content, skip to next file
 
-        try:
-            message_id, date_str, raw_content, subject = parse_eml_file(file_path)
-            if raw_content is None:
-                continue  # No content, skip to next file
+                size = len(raw_content)
+                size_str = f"{size / 1024:.1f}KB"
 
-            size = len(raw_content)
-            size_str = f"{size / 1024:.1f}KB"
+                # Truncate subject for display
+                display_subject = (subject[:40] + "...") if len(subject) > 40 else subject
 
-            # Truncate subject for display
-            display_subject = (subject[:40] + "...") if len(subject) > 40 else subject
+                # Get flags from manifest if apply_flags is enabled
+                flags = None
+                if apply_flags:
+                    flags = get_flags_from_manifest(manifest, message_id)
 
-            # Get flags from manifest if apply_flags is enabled
-            flags = None
-            if apply_flags:
-                flags = get_flags_from_manifest(manifest, message_id)
+                # Get labels for this message
+                labels = get_labels_from_manifest(manifest, message_id) if apply_labels else []
 
-            # Get labels for this message
-            labels = get_labels_from_manifest(manifest, message_id) if apply_labels else []
+                # Determine target folder and remaining labels
+                if gmail_mode:
+                    target_folder, remaining_labels = provider_gmail.resolve_target(labels)
+                else:
+                    target_folder = folder_name
+                    remaining_labels = labels
 
-            # Determine target folder and remaining labels
-            if gmail_mode:
-                target_folder, remaining_labels = provider_gmail.resolve_target(labels)
-            else:
-                target_folder = folder_name
-                remaining_labels = labels
-
-            existing_dest_msg_ids = _load_folder_msg_ids(
-                dest,
-                target_folder,
-                existing_dest_msg_ids_by_folder,
-                existing_dest_msg_ids_lock,
-                progress_cache_data,
-                progress_cache_lock,
-                dest_host,
-                dest_user,
-            )
-
-            # Check if email already exists on destination using pre-fetched set
-            email_already_on_dest = (
-                message_id and existing_dest_msg_ids is not None and message_id in existing_dest_msg_ids
-            )
-
-            # Incremental default: skip entirely if already present
-            if email_already_on_dest and not full_restore:
-                safe_print(f"[{target_folder}] SKIP (already present) | {size_str:<8} | {display_subject}")
-                continue  # Skip to next file
-
-            if email_already_on_dest:
-                # Full restore: treat as existing for flag sync
-                upload_result = UploadResult.ALREADY_EXISTS
-            else:
-                # Upload — skip per-message SEARCH since we have a pre-fetched set
-                upload_result = upload_email(
+                existing_dest_msg_ids = _load_folder_msg_ids(
                     dest,
                     target_folder,
-                    raw_content,
-                    date_str,
-                    message_id,
-                    flags,
-                    check_duplicate=(existing_dest_msg_ids is None),
+                    existing_dest_msg_ids_by_folder,
+                    existing_dest_msg_ids_lock,
+                    progress_cache_data,
+                    progress_cache_lock,
+                    dest_host,
+                    dest_user,
                 )
 
-            # Only record progress when upload succeeds or email already exists.
-            # Failed uploads should not be marked as processed to allow retry on next run.
-            if upload_result in (UploadResult.SUCCESS, UploadResult.ALREADY_EXISTS):
-                restore_cache.record_progress(
-                    message_id=message_id,
-                    folder_name=target_folder,
-                    existing_dest_msg_ids=existing_dest_msg_ids,
-                    existing_dest_msg_ids_lock=existing_dest_msg_ids_lock,
-                    progress_cache_path=progress_cache_path,
-                    progress_cache_data=progress_cache_data,
-                    progress_cache_lock=progress_cache_lock,
-                    dest_host=dest_host,
-                    dest_user=dest_user,
-                    log_fn=safe_print,
+                # Check if email already exists on destination using pre-fetched set
+                email_already_on_dest = (
+                    message_id and existing_dest_msg_ids is not None and message_id in existing_dest_msg_ids
                 )
 
-            if upload_result == UploadResult.ALREADY_EXISTS:
-                safe_print(f"[{target_folder}] SKIP (exists) | {size_str:<8} | {display_subject}")
-                # Full restore preserves legacy behavior: sync flags on existing email if requested
-                if full_restore and apply_flags and flags and message_id:
-                    imap_common.sync_flags_on_existing(dest, target_folder, message_id, flags, size)
-            elif upload_result == UploadResult.SUCCESS:
-                safe_print(f"[{target_folder}] UPLOADED      | {size_str:<8} | {display_subject}")
-                # Show applied flags in same style as labels
-                if flags:
-                    for flag in flags.split():
-                        safe_print(f"  -> Applied flag: {flag}")
-            else:  # FAILURE
-                safe_print(f"[{target_folder}] FAILED        | {size_str:<8} | {display_subject}")
+                # Incremental default: skip entirely if already present
+                if email_already_on_dest and not full_restore:
+                    safe_print(f"[{target_folder}] SKIP (already present) | {size_str:<8} | {display_subject}")
+                    continue  # Skip to next file
 
-            # Apply remaining Gmail labels:
-            # - Full restore: apply/sync labels even for existing emails
-            # - Incremental (default): apply labels only for newly uploaded emails
-            if apply_labels and remaining_labels and (upload_result == UploadResult.SUCCESS or full_restore):
-                for label in remaining_labels:
-                    label_folder = provider_gmail.label_to_folder(label)
+                if email_already_on_dest:
+                    # Full restore: treat as existing for flag sync
+                    upload_result = UploadResult.ALREADY_EXISTS
+                else:
+                    # Upload — skip per-message SEARCH since we have a pre-fetched set
+                    upload_result = upload_email(
+                        dest,
+                        target_folder,
+                        raw_content,
+                        date_str,
+                        message_id,
+                        flags,
+                        check_duplicate=(existing_dest_msg_ids is None),
+                    )
 
-                    # Skip if this is the same as the target folder
-                    if label_folder == target_folder:
-                        continue
+                # Only record progress when upload succeeds or email already exists.
+                # Failed uploads should not be marked as processed to allow retry on next run.
+                if upload_result in (UploadResult.SUCCESS, UploadResult.ALREADY_EXISTS):
+                    restore_cache.record_progress(
+                        message_id=message_id,
+                        folder_name=target_folder,
+                        existing_dest_msg_ids=existing_dest_msg_ids,
+                        existing_dest_msg_ids_lock=existing_dest_msg_ids_lock,
+                        progress_cache_path=progress_cache_path,
+                        progress_cache_data=progress_cache_data,
+                        progress_cache_lock=progress_cache_lock,
+                        dest_host=dest_host,
+                        dest_user=dest_user,
+                        log_fn=safe_print,
+                    )
 
-                    # Skip system folders we can't upload to
-                    if label_folder in (
-                        provider_gmail.GMAIL_ALL_MAIL,
-                        provider_gmail.GMAIL_SPAM,
-                        provider_gmail.GMAIL_TRASH,
-                    ):
-                        continue
+                if upload_result == UploadResult.ALREADY_EXISTS:
+                    safe_print(f"[{target_folder}] SKIP (exists) | {size_str:<8} | {display_subject}")
+                    # Full restore preserves legacy behavior: sync flags on existing email if requested
+                    if full_restore and apply_flags and flags and message_id:
+                        imap_common.sync_flags_on_existing(dest, target_folder, message_id, flags, size)
+                elif upload_result == UploadResult.SUCCESS:
+                    safe_print(f"[{target_folder}] UPLOADED      | {size_str:<8} | {display_subject}")
+                    # Show applied flags in same style as labels
+                    if flags:
+                        for flag in flags.split():
+                            safe_print(f"  -> Applied flag: {flag}")
+                else:  # FAILURE
+                    safe_print(f"[{target_folder}] FAILED        | {size_str:<8} | {display_subject}")
 
-                    try:
-                        # Get or fetch Message-IDs for label folder (one-time server fetch per folder)
-                        label_folder_msg_ids = _load_folder_msg_ids(
-                            dest,
-                            label_folder,
-                            existing_dest_msg_ids_by_folder,
-                            existing_dest_msg_ids_lock,
-                            progress_cache_data,
-                            progress_cache_lock,
-                            dest_host,
-                            dest_user,
-                        )
+                # Apply remaining Gmail labels:
+                # - Full restore: apply/sync labels even for existing emails
+                # - Incremental (default): apply labels only for newly uploaded emails
+                if apply_labels and remaining_labels and (upload_result == UploadResult.SUCCESS or full_restore):
+                    for label in remaining_labels:
+                        label_folder = provider_gmail.label_to_folder(label)
 
-                        # Check duplicate using pre-fetched set instead of per-message SEARCH
-                        label_already_exists = (
-                            label_folder_msg_ids is not None and message_id and message_id in label_folder_msg_ids
-                        )
+                        # Skip if this is the same as the target folder
+                        if label_folder == target_folder:
+                            continue
 
-                        if not label_already_exists:
-                            append_success = imap_common.append_email(
+                        # Skip system folders we can't upload to
+                        if label_folder in (
+                            provider_gmail.GMAIL_ALL_MAIL,
+                            provider_gmail.GMAIL_SPAM,
+                            provider_gmail.GMAIL_TRASH,
+                        ):
+                            continue
+
+                        try:
+                            # Get or fetch Message-IDs for label folder (one-time server fetch per folder)
+                            label_folder_msg_ids = _load_folder_msg_ids(
                                 dest,
                                 label_folder,
-                                raw_content,
-                                date_str,
-                                flags,
-                                ensure_folder=False,
+                                existing_dest_msg_ids_by_folder,
+                                existing_dest_msg_ids_lock,
+                                progress_cache_data,
+                                progress_cache_lock,
+                                dest_host,
+                                dest_user,
                             )
-                            if append_success:
-                                restore_cache.record_progress(
-                                    message_id=message_id,
-                                    folder_name=label_folder,
-                                    existing_dest_msg_ids=label_folder_msg_ids,
-                                    existing_dest_msg_ids_lock=existing_dest_msg_ids_lock,
-                                    progress_cache_path=progress_cache_path,
-                                    progress_cache_data=progress_cache_data,
-                                    progress_cache_lock=progress_cache_lock,
-                                    dest_host=dest_host,
-                                    dest_user=dest_user,
-                                    log_fn=safe_print,
-                                )
-                                safe_print(f"  -> Applied label: {label}")
-                            else:
-                                safe_print(f"  -> Failed to apply label {label} (will retry on next restore)")
-                        # If email exists in this label folder, sync flags (full restore only)
-                        elif full_restore and apply_flags and flags:
-                            imap_common.sync_flags_on_existing(dest, label_folder, message_id, flags, size)
-                    except Exception as e:
-                        safe_print(f"  -> Error applying label {label}: {e}")
 
-        except Exception as e:
-            safe_print(f"Error processing {filename}: {e}")
+                            # Check duplicate using pre-fetched set instead of per-message SEARCH
+                            label_already_exists = (
+                                label_folder_msg_ids is not None and message_id and message_id in label_folder_msg_ids
+                            )
+
+                            if not label_already_exists:
+                                append_success = imap_common.append_email(
+                                    dest,
+                                    label_folder,
+                                    raw_content,
+                                    date_str,
+                                    flags,
+                                    ensure_folder=False,
+                                )
+                                if append_success:
+                                    restore_cache.record_progress(
+                                        message_id=message_id,
+                                        folder_name=label_folder,
+                                        existing_dest_msg_ids=label_folder_msg_ids,
+                                        existing_dest_msg_ids_lock=existing_dest_msg_ids_lock,
+                                        progress_cache_path=progress_cache_path,
+                                        progress_cache_data=progress_cache_data,
+                                        progress_cache_lock=progress_cache_lock,
+                                        dest_host=dest_host,
+                                        dest_user=dest_user,
+                                        log_fn=safe_print,
+                                    )
+                                    safe_print(f"  -> Applied label: {label}")
+                                else:
+                                    safe_print(f"  -> Failed to apply label {label} (will retry on next restore)")
+                            # If email exists in this label folder, sync flags (full restore only)
+                            elif full_restore and apply_flags and flags:
+                                imap_common.sync_flags_on_existing(dest, label_folder, message_id, flags, size)
+                        except Exception as e:
+                            safe_print(f"  -> Error applying label {label}: {e}")
+
+            except Exception as e:
+                safe_print(f"Error processing {filename}: {e}")
 
 
 def get_local_message_ids(local_folder_path):
@@ -504,7 +494,7 @@ def pre_filter_eml_files(eml_files, dest_msg_ids):
 def restore_folder(
     folder_name,
     local_folder_path,
-    dest_conf,
+    dest_pool,
     manifest,
     apply_labels,
     apply_flags,
@@ -519,16 +509,15 @@ def restore_folder(
     Restore all emails from a local folder to the destination IMAP server.
     """
     safe_print(f"--- Restoring Folder: {folder_name} ---")
+    dest_conf = dest_pool.conf
 
     eml_files = get_eml_files(local_folder_path)
     if not eml_files:
         safe_print(f"No .eml files found in {folder_name}")
         # Even if empty, check for orphans to delete
         if dest_delete:
-            dest = imap_common.get_imap_connection_from_conf(dest_conf)
-            if dest:
+            with dest_pool.connection() as dest:
                 imap_common.delete_orphan_emails(dest, folder_name, set())
-                dest.logout()
         return
 
     safe_print(f"Found {len(eml_files)} emails to restore.")
@@ -563,8 +552,7 @@ def restore_folder(
 
     if not gmail_mode:
         try:
-            dest_tmp = imap_common.get_imap_connection_from_conf(dest_conf)
-            if dest_tmp:
+            with dest_pool.connection() as dest_tmp:
                 _load_folder_msg_ids(
                     dest_tmp,
                     folder_name,
@@ -575,7 +563,6 @@ def restore_folder(
                     dest_conf.get("host"),
                     dest_conf.get("user"),
                 )
-                dest_tmp.logout()
         except Exception:
             pass
 
@@ -590,10 +577,8 @@ def restore_folder(
         safe_print("No new emails to restore.")
         if dest_delete and local_msg_ids is not None:
             safe_print("Syncing destination: removing emails not in local backup...")
-            dest = imap_session.ensure_connection(None, dest_conf)
-            if dest:
+            with dest_pool.connection() as dest:
                 imap_common.delete_orphan_emails(dest, folder_name, local_msg_ids)
-                dest.logout()
 
         restore_cache.maybe_save_dest_index_cache(cache_path, cache_data, cache_lock, force=True)
         return
@@ -611,7 +596,7 @@ def restore_folder(
                     process_restore_batch,
                     batch,
                     folder_name,
-                    dest_conf,
+                    dest_pool,
                     manifest,
                     apply_labels,
                     apply_flags,
@@ -635,10 +620,8 @@ def restore_folder(
     # Delete orphan emails from destination if enabled
     if dest_delete and local_msg_ids is not None:
         safe_print("Syncing destination: removing emails not in local backup...")
-        dest = imap_session.ensure_connection(None, dest_conf)
-        if dest:
+        with dest_pool.connection() as dest:
             imap_common.delete_orphan_emails(dest, folder_name, local_msg_ids)
-            dest.logout()
 
     # Force-flush progress cache at end.
     restore_cache.maybe_save_dest_index_cache(cache_path, cache_data, cache_lock, force=True)
@@ -646,7 +629,7 @@ def restore_folder(
 
 def restore_gmail_with_labels(
     local_path,
-    dest_conf,
+    dest_pool,
     manifest,
     apply_flags,
     full_restore: bool = False,
@@ -684,6 +667,7 @@ def restore_gmail_with_labels(
 
     batches = [eml_files[i : i + BATCH_SIZE] for i in range(0, len(eml_files), BATCH_SIZE)]
 
+    dest_conf = dest_pool.conf
     cache_path = progress_cache_file
     if cache_path is None or progress_cache_data is None or progress_cache_lock is None:
         cache_path, progress_cache_data, progress_cache_lock = imap_common.load_progress_cache(
@@ -703,15 +687,12 @@ def restore_gmail_with_labels(
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
         for batch in batches:
-            # For Gmail, we use a special folder marker to indicate gmail-mode
-            # The process_restore_batch will determine the target folder per-email
-            # based on the manifest labels
             futures.append(
                 executor.submit(
                     process_restore_batch,
                     batch,
                     "__GMAIL_MODE__",  # Special marker - target determined per-email from manifest
-                    dest_conf,
+                    dest_pool,
                     manifest,
                     True,  # apply_labels
                     apply_flags,  # apply_flags
@@ -938,64 +919,30 @@ def main():
             print("Error: Could not connect to destination server.")
             sys.exit(1)
 
-        if args.gmail_mode:
-            dest.logout()
-            # Special Gmail mode
-            restore_gmail_with_labels(
-                local_path,
-                dest_conf,
-                manifest,
-                apply_flags,
-                full_restore=args.full_restore,
-                progress_cache_file=progress_cache_file,
-                progress_cache_data=progress_cache_data,
-                progress_cache_lock=progress_cache_lock,
-            )
-            dest = None  # Connection handled by restore_gmail_with_labels
-        elif args.folder:
-            # Restore specific folder
-            folder_path = os.path.join(local_path, args.folder.replace("/", os.sep))
-            if not os.path.exists(folder_path):
-                print(f"Error: Folder not found: {folder_path}")
-                sys.exit(1)
-            restore_folder(
-                args.folder,
-                folder_path,
-                dest_conf,
-                manifest,
-                apply_labels,
-                apply_flags,
-                args.dest_delete,
-                full_restore=args.full_restore,
-                cache_root=local_path,
-                progress_cache_file=progress_cache_file,
-                progress_cache_data=progress_cache_data,
-                progress_cache_lock=progress_cache_lock,
-            )
-            dest.logout()
-        else:
-            # Restore all folders
-            folders = imap_common.get_backup_folders(local_path)
-            if not folders:
-                print("No backup folders found.")
-                sys.exit(1)
-
-            print(f"Found {len(folders)} folders to restore.\n")
-            for folder_name, folder_path in folders:
-                # Skip manifest files
-                if folder_name in ("labels_manifest.json", "flags_manifest.json"):
-                    continue
-
-                # Proactively refresh OAuth2 token and ensure connection is healthy between folders
-                dest = imap_session.ensure_connection(dest, dest_conf)
-                if not dest:
-                    print("Fatal: Could not reconnect to destination IMAP server. Aborting.")
+        dest_pool = imap_pool.ConnectionPool(dest_conf, max_size=MAX_WORKERS)
+        try:
+            if args.gmail_mode:
+                dest.logout()
+                restore_gmail_with_labels(
+                    local_path,
+                    dest_pool,
+                    manifest,
+                    apply_flags,
+                    full_restore=args.full_restore,
+                    progress_cache_file=progress_cache_file,
+                    progress_cache_data=progress_cache_data,
+                    progress_cache_lock=progress_cache_lock,
+                )
+                dest = None
+            elif args.folder:
+                folder_path = os.path.join(local_path, args.folder.replace("/", os.sep))
+                if not os.path.exists(folder_path):
+                    print(f"Error: Folder not found: {folder_path}")
                     sys.exit(1)
-
                 restore_folder(
-                    folder_name,
+                    args.folder,
                     folder_path,
-                    dest_conf,
+                    dest_pool,
                     manifest,
                     apply_labels,
                     apply_flags,
@@ -1006,8 +953,41 @@ def main():
                     progress_cache_data=progress_cache_data,
                     progress_cache_lock=progress_cache_lock,
                 )
+                dest.logout()
+            else:
+                folders = imap_common.get_backup_folders(local_path)
+                if not folders:
+                    print("No backup folders found.")
+                    sys.exit(1)
 
-            dest.logout()
+                print(f"Found {len(folders)} folders to restore.\n")
+                for folder_name, folder_path in folders:
+                    if folder_name in ("labels_manifest.json", "flags_manifest.json"):
+                        continue
+
+                    dest = imap_session.ensure_connection(dest, dest_conf)
+                    if not dest:
+                        print("Fatal: Could not reconnect to destination IMAP server. Aborting.")
+                        sys.exit(1)
+
+                    restore_folder(
+                        folder_name,
+                        folder_path,
+                        dest_pool,
+                        manifest,
+                        apply_labels,
+                        apply_flags,
+                        args.dest_delete,
+                        full_restore=args.full_restore,
+                        cache_root=local_path,
+                        progress_cache_file=progress_cache_file,
+                        progress_cache_data=progress_cache_data,
+                        progress_cache_lock=progress_cache_lock,
+                    )
+
+                dest.logout()
+        finally:
+            dest_pool.shutdown()
 
         print("\nRestore completed successfully.")
 

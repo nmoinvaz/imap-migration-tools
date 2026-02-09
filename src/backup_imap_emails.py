@@ -54,10 +54,10 @@ import concurrent.futures
 import json
 import os
 import sys
-import threading
 
 import imap_common
 import imap_oauth2
+import imap_pool
 import imap_session
 import provider_exchange
 import provider_gmail
@@ -67,8 +67,6 @@ MAX_WORKERS = 10
 BATCH_SIZE = 10
 MANIFEST_FILENAME = "labels_manifest.json"
 
-# Thread-local storage
-thread_local = threading.local()
 safe_print = imap_common.safe_print
 
 
@@ -136,37 +134,34 @@ def process_single_uid(src, uid, folder_name, local_folder_path):
             return (True, src)  # Don't retry other errors
 
 
-def process_batch(uids, folder_name, src_conf, local_folder_path):
-    src = imap_session.get_thread_connection(thread_local, "src", src_conf)
-    if not src:
-        safe_print("Error: Could not establish connection for batch.")
-        return
+class _AuthRetry(Exception):
+    """Raised inside a pool context to signal an auth error requiring reconnect."""
 
-    try:
-        src.select(f'"{folder_name}"', readonly=True)
-    except Exception as e:
-        safe_print(f"Error selecting folder {folder_name} in worker: {e}")
-        return
 
-    for uid in uids:
-        uid_str = uid.decode("utf-8") if isinstance(uid, bytes) else str(uid)
-        max_retries = 2
+def process_batch(uids, folder_name, src_pool, local_folder_path):
+    remaining = list(uids)
+    max_retries = 2
 
-        for attempt in range(max_retries):
-            src, ok = imap_session.ensure_folder_session(src, src_conf, folder_name, readonly=True)
-            thread_local.src = src
-            if not ok:
-                safe_print(f"[{folder_name}] ERROR: Connection/folder lost for UID {uid_str}")
-                return
-
-            success, src = process_single_uid(src, uid, folder_name, local_folder_path)
-            thread_local.src = src
-
-            if success:
-                break
+    for attempt in range(max_retries):
+        try:
+            with src_pool.connection() as src:
+                src.select(f'"{folder_name}"', readonly=True)
+                while remaining:
+                    uid = remaining[0]
+                    success, _conn = process_single_uid(src, uid, folder_name, local_folder_path)
+                    if not success:
+                        raise _AuthRetry()
+                    remaining.pop(0)
+            break  # all done
+        except _AuthRetry:
             if attempt < max_retries - 1:
-                src = None
-                thread_local.src = None
+                safe_print(f"[{folder_name}] Retrying batch after auth error...")
+                continue
+            break
+        except Exception as e:
+            if remaining:
+                safe_print(f"[{folder_name}] Batch error: {e}")
+            break
 
 
 def get_existing_uids(local_path):
@@ -583,7 +578,7 @@ def delete_orphan_local_files(local_folder_path, server_uids):
     return deleted_count
 
 
-def backup_folder(src_main, folder_name, local_base_path, src_conf, dest_delete=False):
+def backup_folder(src_main, folder_name, local_base_path, src_pool, dest_delete=False):
     safe_print(f"--- Processing Folder: {folder_name} ---")
 
     # create local path
@@ -667,7 +662,7 @@ def backup_folder(src_main, folder_name, local_base_path, src_conf, dest_delete=
     try:
         futures = []
         for batch in uid_batches:
-            futures.append(executor.submit(process_batch, batch, folder_name, src_conf, local_folder_path))
+            futures.append(executor.submit(process_batch, batch, folder_name, src_pool, local_folder_path))
 
         for future in concurrent.futures.as_completed(futures):
             future.result()
@@ -848,26 +843,30 @@ def main():
             sys.exit(0)
 
         # Gmail mode: backup only [Gmail]/All Mail
-        if args.gmail_mode:
-            backup_folder(src, provider_gmail.GMAIL_ALL_MAIL, local_path, src_conf, args.dest_delete)
-        elif args.folder:
-            backup_folder(src, args.folder, local_path, src_conf, args.dest_delete)
-        else:
-            # Reconnect after potentially long manifest building
-            src = imap_session.ensure_connection(src, src_conf)
-            if not src:
-                print("Warning: Could not reconnect to IMAP server for backup. Manifest was saved successfully.")
-                sys.exit(0)
-            folders = imap_common.list_selectable_folders(src)
-            for name in folders:
-                if provider_exchange.is_special_folder(name):
-                    print(f"Skipping Exchange system folder: {name}")
-                    continue
+        src_pool = imap_pool.ConnectionPool(src_conf, max_size=MAX_WORKERS)
+        try:
+            if args.gmail_mode:
+                backup_folder(src, provider_gmail.GMAIL_ALL_MAIL, local_path, src_pool, args.dest_delete)
+            elif args.folder:
+                backup_folder(src, args.folder, local_path, src_pool, args.dest_delete)
+            else:
+                # Reconnect after potentially long manifest building
                 src = imap_session.ensure_connection(src, src_conf)
                 if not src:
-                    print("Fatal: Could not reconnect to IMAP server. Aborting.")
-                    sys.exit(1)
-                backup_folder(src, name, local_path, src_conf, args.dest_delete)
+                    print("Warning: Could not reconnect to IMAP server for backup. Manifest was saved successfully.")
+                    sys.exit(0)
+                folders = imap_common.list_selectable_folders(src)
+                for name in folders:
+                    if provider_exchange.is_special_folder(name):
+                        print(f"Skipping Exchange system folder: {name}")
+                        continue
+                    src = imap_session.ensure_connection(src, src_conf)
+                    if not src:
+                        print("Fatal: Could not reconnect to IMAP server. Aborting.")
+                        sys.exit(1)
+                    backup_folder(src, name, local_path, src_pool, args.dest_delete)
+        finally:
+            src_pool.shutdown()
 
         try:
             src.logout()
